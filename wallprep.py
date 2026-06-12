@@ -141,6 +141,14 @@ def random_name(length=NAME_LENGTH):
                                   k=length))
 
 
+def display_path(p) -> str:
+    """Shorten a path for display: /home/user/x -> ~/x."""
+    try:
+        return "~/" + str(Path(p).relative_to(Path.home()))
+    except Exception:
+        return str(p)
+
+
 def scaled_to_longest(w: int, h: int, target: int):
     """New (w, h) so the LONGEST side equals target, aspect kept."""
     longest = max(w, h)
@@ -196,7 +204,18 @@ class WallprepApp(Gtk.Window):
                   "set_margin_start", "set_margin_end"):
             getattr(bar, m)(10)
 
-        # Resize grouped with its size field
+        self.clean_btn = Gtk.Button(label="Clean")
+        self.clean_btn.set_tooltip_text(
+            "Stage metadata removal (preview only)")
+        self.clean_btn.connect("clicked", self.on_stage_clean)
+        bar.pack_start(self.clean_btn, False, False, 0)
+
+        self.rename_btn = Gtk.Button(label="Rename")
+        self.rename_btn.set_tooltip_text(
+            f"Stage a random {NAME_LENGTH}-character name (preview only)")
+        self.rename_btn.connect("clicked", self.on_stage_rename)
+        bar.pack_start(self.rename_btn, False, False, 0)
+
         self.resize_btn = Gtk.Button(label="Resize")
         self.resize_btn.set_tooltip_text(
             "Stage a resize: the LONGEST side becomes this size "
@@ -213,17 +232,11 @@ class WallprepApp(Gtk.Window):
         bar.pack_start(Gtk.Separator(
             orientation=Gtk.Orientation.VERTICAL), False, False, 4)
 
-        self.rename_btn = Gtk.Button(label="Rename")
-        self.rename_btn.set_tooltip_text(
-            f"Stage a random {NAME_LENGTH}-character name (preview only)")
-        self.rename_btn.connect("clicked", self.on_stage_rename)
-        bar.pack_start(self.rename_btn, False, False, 0)
-
-        self.clean_btn = Gtk.Button(label="Clean")
-        self.clean_btn.set_tooltip_text(
-            "Stage metadata removal (preview only)")
-        self.clean_btn.connect("clicked", self.on_stage_clean)
-        bar.pack_start(self.clean_btn, False, False, 0)
+        self.all_btn = Gtk.Button(label="All 3")
+        self.all_btn.set_tooltip_text(
+            "Stage Clean + Rename + Resize together (preview only)")
+        self.all_btn.connect("clicked", self.on_stage_all)
+        bar.pack_start(self.all_btn, False, False, 0)
 
         sel_all = Gtk.Button(label="Select all")
         sel_all.connect("clicked",
@@ -372,8 +385,13 @@ class WallprepApp(Gtk.Window):
             action=Gtk.FileChooserAction.SELECT_FOLDER)
         dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
                            Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        last = self.cfg.get("last_folder")
+        if last and Path(last).is_dir():
+            dialog.set_current_folder(last)
         if dialog.run() == Gtk.ResponseType.OK:
             folder = Path(dialog.get_filename())
+            self.cfg["last_folder"] = str(folder)
+            save_json(CONFIG_FILE, self.cfg)
             self.add_paths(sorted(p for p in folder.iterdir()
                                   if p.is_file()
                                   and p.suffix.lower() in SUPPORTED))
@@ -477,7 +495,7 @@ class WallprepApp(Gtk.Window):
         if staged:
             status = "staged: " + "+".join(staged)
         elif st["done"]:
-            status = f"done ✓ ({st['done']})"
+            status = f"✅ done → {display_path(st['done'])}"
         else:
             status = ""
         for row in self.store:
@@ -538,7 +556,7 @@ class WallprepApp(Gtk.Window):
 
     def set_ops_sensitive(self, state):
         for b in (self.resize_btn, self.rename_btn,
-                  self.clean_btn, self.apply_btn):
+                  self.clean_btn, self.all_btn, self.apply_btn):
             b.set_sensitive(state)
 
     def output_dir(self):
@@ -589,6 +607,28 @@ class WallprepApp(Gtk.Window):
             GLib.idle_add(self._refresh_row, p)
         self._staging_hint()
 
+    def on_stage_all(self, _btn):
+        """Stage Clean + Rename + Resize for the selection in one click."""
+        target = int(self.width_spin.get_value())
+        paths = self.selected_paths()
+        taken = {st["new_name"] for st in self.info.values()
+                 if st["new_name"]}
+        for p in paths:
+            st = self.info[p]
+            st["strip"] = True
+            if st["w"]:
+                st["resize_to"] = scaled_to_longest(st["w"], st["h"], target)
+            if not st["new_name"]:
+                ext = Path(p).suffix.lower().replace(".jpeg", ".jpg")
+                while True:
+                    cand = random_name() + ext
+                    if cand not in taken:
+                        taken.add(cand)
+                        break
+                st["new_name"] = cand
+            GLib.idle_add(self._refresh_row, p)
+        self._staging_hint()
+
     def _staging_hint(self):
         n = sum(1 for st in self.info.values()
                 if st["resize_to"] or st["new_name"] or st["strip"])
@@ -629,17 +669,17 @@ class WallprepApp(Gtk.Window):
                     # remember this source file as processed
                     try:
                         self.processed[fingerprint(path)] = {
-                            "output": dest.name,
+                            "output": str(dest),
                             "date": time.strftime("%Y-%m-%d %H:%M"),
                         }
                         save_json(PROCESSED_FILE, self.processed)
                     except Exception:
                         pass
                     self.info[path].update(resize_to=None, new_name=None,
-                                           strip=False, done=dest.name)
+                                           strip=False, done=str(dest))
                     GLib.idle_add(self._refresh_row, path)
                     GLib.idle_add(self._set_status, path,
-                                  f"✅ verified → {dest.name}")
+                                  f"✅ verified → {display_path(dest)}")
                 else:
                     GLib.idle_add(self._set_status, path,
                                   f"⚠ check failed: {problem}")
