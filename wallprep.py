@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-wallprep — prepare wallpapers for publishing (GTK GUI, v2)
+wallprep — prepare wallpapers for publishing (GTK GUI, v3)
 
 Workflow:
-  1. Open a folder -> every image in it appears in the list
-  2. Select one, several (Ctrl/Shift+click), or all images
-  3. Apply operations with the buttons:
+  1. Add images: a whole folder ("Add folder…") or individual files
+     ("Add images…")
+  2. Pick the OUTPUT folder in the toolbar — select an existing one, or
+     create a new one right in the chooser dialog (Create Folder button)
+  3. Select one, several (Ctrl/Shift+click), or none (= all), then:
        Resize          -> shrink to chosen width (never upscales)
        Rename          -> random 5-character name
        Strip metadata  -> remove ALL embedded metadata (exiftool)
-       Do all 3        -> resize + rename + strip in one go
+       Do all 3        -> resize + strip + rename in one go
 
-Files are modified IN PLACE, directly in the folder you opened.
-Double-click a row to inspect its full metadata.
+Originals are NEVER modified — every operation writes a processed COPY
+into the output folder. Double-click a row to inspect its metadata.
 
 Dependencies (Ubuntu):
   sudo apt install python3-gi gir1.2-gtk-3.0 imagemagick libimage-exiftool-perl
@@ -22,6 +24,7 @@ Run:
 
 import json
 import random
+import shutil
 import string
 import subprocess
 import threading
@@ -29,13 +32,13 @@ from pathlib import Path
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GLib
+from gi.repository import Gtk, GLib, Gdk
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".webp"}
 NAME_LENGTH = 5
+DEFAULT_OUTPUT = Path.home() / "wallpapers" / "ready"
 
-# Tags exiftool reports that aren't real embedded metadata (file system info,
-# image structure). Ignored when counting / displaying.
+# Tags exiftool reports that aren't real embedded metadata.
 BORING_TAGS = {
     "SourceFile", "ExifToolVersion", "FileName", "Directory", "FileSize",
     "FileModifyDate", "FileAccessDate", "FileInodeChangeDate",
@@ -46,12 +49,11 @@ BORING_TAGS = {
     "BitDepth", "ColorType", "Compression", "Filter", "Interlace",
 }
 
-# Tag-name fragments that suggest AI generation — flagged in the list.
+# Tag-name fragments that suggest AI generation.
 AI_HINTS = ("software", "artist", "creator", "generator", "prompt", "stable",
             "diffusion", "midjourney", "dall", "comfyui", "parameters",
             "usercomment", "description", "model")
 
-# ListStore columns
 COL_PATH, COL_NAME, COL_DIMS, COL_META, COL_STATUS = range(5)
 
 
@@ -84,28 +86,31 @@ def random_name(length=NAME_LENGTH):
 class WallprepApp(Gtk.Window):
     def __init__(self):
         super().__init__(title="wallprep")
-        self.set_default_size(860, 560)
-        self.folder = None
-        self.meta_cache = {}   # path -> metadata dict
+        self.set_default_size(880, 580)
+        self.meta_cache = {}
         self.busy = False
 
         # ---------- header bar ----------
         header = Gtk.HeaderBar(title="wallprep", show_close_button=True)
         self.set_titlebar(header)
 
-        open_btn = Gtk.Button(label="Open folder…")
-        open_btn.connect("clicked", self.on_open_folder)
-        header.pack_start(open_btn)
+        add_folder = Gtk.Button(label="Add folder…")
+        add_folder.connect("clicked", self.on_add_folder)
+        header.pack_start(add_folder)
 
-        refresh_btn = Gtk.Button.new_from_icon_name(
-            "view-refresh-symbolic", Gtk.IconSize.BUTTON)
-        refresh_btn.set_tooltip_text("Rescan folder")
-        refresh_btn.connect("clicked", lambda *_: self.load_folder())
-        header.pack_start(refresh_btn)
+        add_files = Gtk.Button(label="Add images…")
+        add_files.connect("clicked", self.on_add_files)
+        header.pack_start(add_files)
+
+        clear_btn = Gtk.Button.new_from_icon_name(
+            "edit-clear-all-symbolic", Gtk.IconSize.BUTTON)
+        clear_btn.set_tooltip_text("Clear the list")
+        clear_btn.connect("clicked", self.on_clear)
+        header.pack_start(clear_btn)
 
         self.all_btn = Gtk.Button(label="Do all 3")
         self.all_btn.get_style_context().add_class("suggested-action")
-        self.all_btn.set_tooltip_text("Resize + rename + strip metadata")
+        self.all_btn.set_tooltip_text("Resize + strip metadata + rename")
         self.all_btn.connect("clicked", self.on_do_all)
         header.pack_end(self.all_btn)
 
@@ -141,6 +146,31 @@ class WallprepApp(Gtk.Window):
                         lambda *_: self.tree.get_selection().select_all())
         bar.pack_end(sel_all, False, False, 0)
 
+        # ---------- output folder row ----------
+        out_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for m in ("set_margin_bottom", "set_margin_start", "set_margin_end"):
+            getattr(out_row, m)(10)
+
+        out_label = Gtk.Label()
+        out_label.set_markup("<b>Output folder:</b>")
+        out_row.pack_start(out_label, False, False, 0)
+
+        self.out_btn = Gtk.FileChooserButton(
+            title="Choose output folder (use 'Create Folder' to make a new one)",
+            action=Gtk.FileChooserAction.SELECT_FOLDER)
+        DEFAULT_OUTPUT.mkdir(parents=True, exist_ok=True)
+        self.out_btn.set_filename(str(DEFAULT_OUTPUT))
+        self.out_btn.set_tooltip_text(
+            "Processed copies are saved here. Originals are never modified. "
+            "You can create a new folder inside the chooser dialog.")
+        out_row.pack_start(self.out_btn, True, True, 0)
+
+        open_out = Gtk.Button.new_from_icon_name(
+            "folder-open-symbolic", Gtk.IconSize.BUTTON)
+        open_out.set_tooltip_text("Open output folder in file manager")
+        open_out.connect("clicked", self.on_open_output)
+        out_row.pack_start(open_out, False, False, 0)
+
         # ---------- file list ----------
         self.store = Gtk.ListStore(str, str, str, str, str)
         self.tree = Gtk.TreeView(model=self.store)
@@ -155,54 +185,93 @@ class WallprepApp(Gtk.Window):
             self.tree.append_column(col)
         self.tree.connect("row-activated", self.on_inspect)
 
+        # drag & drop files/folders onto the list
+        self.tree.drag_dest_set(Gtk.DestDefaults.ALL, [],
+                                Gdk.DragAction.COPY)
+        self.tree.drag_dest_add_uri_targets()
+        self.tree.connect("drag-data-received", self.on_drop)
+
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_vexpand(True)
         scrolled.add(self.tree)
 
         # ---------- hint bar ----------
         self.hint = Gtk.Label(
-            label="Open a folder to load its images. Files are modified "
-                  "in place. Double-click a row to inspect metadata.")
+            label="Add a folder or individual images (or drag them here). "
+                  "Processed copies go to the output folder — originals "
+                  "are never touched.")
         self.hint.set_margin_top(6)
         self.hint.set_margin_bottom(8)
         self.hint.get_style_context().add_class("dim-label")
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         vbox.pack_start(bar, False, False, 0)
+        vbox.pack_start(out_row, False, False, 0)
         vbox.pack_start(scrolled, True, True, 0)
         vbox.pack_start(self.hint, False, False, 0)
         self.add(vbox)
         self.set_ops_sensitive(False)
 
-    # ================= folder loading =================
-    def on_open_folder(self, _btn):
+    # ================= adding files =================
+    def on_add_folder(self, _btn):
         dialog = Gtk.FileChooserDialog(
-            title="Choose wallpaper folder", parent=self,
+            title="Add all images from a folder", parent=self,
             action=Gtk.FileChooserAction.SELECT_FOLDER)
         dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
                            Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
         if dialog.run() == Gtk.ResponseType.OK:
-            self.folder = Path(dialog.get_filename())
-            self.load_folder()
+            folder = Path(dialog.get_filename())
+            self.add_paths(sorted(p for p in folder.iterdir()
+                                  if p.is_file()
+                                  and p.suffix.lower() in SUPPORTED))
         dialog.destroy()
 
-    def load_folder(self):
-        if not self.folder:
-            return
+    def on_add_files(self, _btn):
+        dialog = Gtk.FileChooserDialog(
+            title="Add images", parent=self,
+            action=Gtk.FileChooserAction.OPEN)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                           Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        dialog.set_select_multiple(True)
+        f = Gtk.FileFilter()
+        f.set_name("Images (jpg, png, webp)")
+        for pat in ("*.jpg", "*.jpeg", "*.png", "*.webp",
+                    "*.JPG", "*.JPEG", "*.PNG", "*.WEBP"):
+            f.add_pattern(pat)
+        dialog.add_filter(f)
+        if dialog.run() == Gtk.ResponseType.OK:
+            self.add_paths([Path(p) for p in dialog.get_filenames()])
+        dialog.destroy()
+
+    def on_drop(self, _w, _ctx, _x, _y, data, _info, _time):
+        paths = []
+        for uri in data.get_uris():
+            p = Path(GLib.filename_from_uri(uri)[0])
+            if p.is_dir():
+                paths += sorted(q for q in p.iterdir()
+                                if q.is_file()
+                                and q.suffix.lower() in SUPPORTED)
+            elif p.suffix.lower() in SUPPORTED:
+                paths.append(p)
+        self.add_paths(paths)
+
+    def add_paths(self, paths):
+        existing = {row[COL_PATH] for row in self.store}
+        new = [str(p) for p in paths if str(p) not in existing]
+        for p in new:
+            self.store.append([p, Path(p).name, "…", "…", ""])
+        if new:
+            self.set_ops_sensitive(True)
+            self.hint.set_label(f"{len(self.store)} image(s) loaded — "
+                                "processed copies go to the output folder")
+            threading.Thread(target=self._scan, args=(new,),
+                             daemon=True).start()
+
+    def on_clear(self, _btn):
         self.store.clear()
         self.meta_cache.clear()
-        files = sorted(p for p in self.folder.iterdir()
-                       if p.suffix.lower() in SUPPORTED and p.is_file())
-        for p in files:
-            self.store.append([str(p), p.name, "…", "…", ""])
-        self.set_ops_sensitive(bool(files))
-        self.hint.set_label(
-            f"{len(files)} image(s) in {self.folder} — files are modified "
-            "in place" if files else f"No images found in {self.folder}")
-        if files:
-            threading.Thread(target=self._scan,
-                             args=([str(p) for p in files],),
-                             daemon=True).start()
+        self.set_ops_sensitive(False)
+        self.hint.set_label("List cleared. Add a folder or images to start.")
 
     def _scan(self, paths):
         for p in paths:
@@ -224,7 +293,7 @@ class WallprepApp(Gtk.Window):
                     row[col] = val
         return False
 
-    # ================= selection helpers =================
+    # ================= helpers =================
     def selected_paths(self):
         """Selected rows; if nothing is selected, all rows."""
         model, tree_paths = self.tree.get_selection().get_selected_rows()
@@ -237,94 +306,107 @@ class WallprepApp(Gtk.Window):
                   self.strip_btn, self.all_btn):
             b.set_sensitive(state)
 
-    # ================= operations =================
-    def _run_async(self, worker, paths, *args):
+    def output_dir(self):
+        out = Path(self.out_btn.get_filename() or DEFAULT_OUTPUT)
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+
+    def _dest_same_name(self, src: Path, out: Path) -> Path:
+        """Output path keeping the original name; add -1, -2… if taken."""
+        dest = out / src.name
+        i = 1
+        while dest.exists() and dest != src:
+            dest = out / f"{src.stem}-{i}{src.suffix}"
+            i += 1
+        return dest
+
+    def _dest_random(self, src: Path, out: Path) -> Path:
+        ext = src.suffix.lower().replace(".jpeg", ".jpg")
+        while True:
+            dest = out / (random_name() + ext)
+            if not dest.exists():
+                return dest
+
+    # ================= async runner =================
+    def _run_async(self, worker, *args):
+        paths = self.selected_paths()
         if self.busy or not paths:
             return
+        out = self.output_dir()
         self.busy = True
         self.set_ops_sensitive(False)
-        threading.Thread(target=self._wrap, args=(worker, paths) + args,
+        threading.Thread(target=self._wrap,
+                         args=(worker, paths, out) + args,
                          daemon=True).start()
 
-    def _wrap(self, worker, paths, *args):
+    def _wrap(self, worker, paths, out, *args):
         ok = 0
         for p in paths:
             GLib.idle_add(self._set_cols, p, {COL_STATUS: "working…"})
             try:
-                worker(p, *args)
+                dest = worker(Path(p), out, *args)
                 ok += 1
+                GLib.idle_add(self._set_cols, p,
+                              {COL_STATUS: f"✓ → {dest.name}"})
             except Exception as e:
                 GLib.idle_add(self._set_cols, p,
                               {COL_STATUS: f"error: {e.__class__.__name__}"})
-        GLib.idle_add(self._done, ok, len(paths))
+        GLib.idle_add(self._done, ok, len(paths), out)
 
-    def _done(self, ok, total):
+    def _done(self, ok, total, out):
         self.busy = False
         self.set_ops_sensitive(True)
-        self.hint.set_label(f"Done — {ok}/{total} file(s) processed "
-                            f"(in place, in {self.folder})")
+        self.hint.set_label(f"Done — {ok}/{total} copy(ies) saved to {out} "
+                            "(originals untouched)")
         return False
 
-    # --- resize ---
+    # ================= operations (each returns dest Path) ============
     def on_resize(self, _btn):
-        self._run_async(self._op_resize, self.selected_paths(),
-                        int(self.width_spin.get_value()))
+        self._run_async(self._op_resize, int(self.width_spin.get_value()))
 
-    def _op_resize(self, path, width):
-        subprocess.run(["mogrify", "-resize", f"{width}x>", path],
+    def _op_resize(self, src, out, width):
+        dest = self._dest_same_name(src, out)
+        subprocess.run(["convert", str(src), "-resize", f"{width}x>",
+                        str(dest)],
                        check=True, capture_output=True, timeout=120)
-        w, h = image_dimensions(path)
-        GLib.idle_add(self._set_cols, path,
-                      {COL_DIMS: f"{w}×{h}", COL_STATUS: "✓ resized"})
+        return dest
 
-    # --- rename ---
     def on_rename(self, _btn):
-        self._run_async(self._op_rename, self.selected_paths())
+        self._run_async(self._op_rename)
 
-    def _op_rename(self, path):
-        src = Path(path)
-        ext = src.suffix.lower().replace(".jpeg", ".jpg")
-        while True:
-            dest = src.with_name(random_name() + ext)
-            if not dest.exists():
-                break
-        src.rename(dest)
-        self.meta_cache[str(dest)] = self.meta_cache.pop(path, {})
-        GLib.idle_add(self._after_rename, path, str(dest))
+    def _op_rename(self, src, out):
+        dest = self._dest_random(src, out)
+        shutil.copy2(src, dest)
+        return dest
 
-    def _after_rename(self, old, new):
-        for row in self.store:
-            if row[COL_PATH] == old:
-                row[COL_PATH] = new
-                row[COL_NAME] = Path(new).name
-                row[COL_STATUS] = "✓ renamed"
-        return False
-
-    # --- strip metadata ---
     def on_strip(self, _btn):
-        self._run_async(self._op_strip, self.selected_paths())
+        self._run_async(self._op_strip)
 
-    def _op_strip(self, path):
+    def _op_strip(self, src, out):
+        dest = self._dest_same_name(src, out)
+        shutil.copy2(src, dest)
         subprocess.run(["exiftool", "-all=", "-overwrite_original",
-                        "-quiet", path],
+                        "-quiet", str(dest)],
                        check=True, capture_output=True, timeout=60)
-        self.meta_cache[path] = read_metadata(path)
-        n = len(self.meta_cache[path])
-        label = "clean ✓" if n == 0 else f"{n} tags"
-        GLib.idle_add(self._set_cols, path,
-                      {COL_META: label, COL_STATUS: "✓ stripped"})
+        return dest
 
-    # --- all three ---
     def on_do_all(self, _btn):
-        self._run_async(self._op_all, self.selected_paths(),
-                        int(self.width_spin.get_value()))
+        self._run_async(self._op_all, int(self.width_spin.get_value()))
 
-    def _op_all(self, path, width):
-        self._op_resize(path, width)
-        self._op_strip(path)
-        self._op_rename(path)   # last, so earlier steps use the old path
+    def _op_all(self, src, out, width):
+        dest = self._dest_random(src, out)
+        subprocess.run(["convert", str(src), "-resize", f"{width}x>",
+                        str(dest)],
+                       check=True, capture_output=True, timeout=120)
+        subprocess.run(["exiftool", "-all=", "-overwrite_original",
+                        "-quiet", str(dest)],
+                       check=True, capture_output=True, timeout=60)
+        return dest
 
-    # ================= metadata inspector =================
+    # ================= misc =================
+    def on_open_output(self, _btn):
+        subprocess.Popen(["xdg-open", str(self.output_dir())])
+
     def on_inspect(self, _tree, tree_path, _col):
         row = self.store[tree_path]
         path = row[COL_PATH]
