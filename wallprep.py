@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-wallprep — prepare wallpapers for publishing (GTK GUI, v5)
+wallprep — prepare wallpapers for publishing (GTK GUI, v6)
 
 Workflow:
-  1. Add images (whole folder, individual files, or drag & drop)
-  2. Select rows and click Resize / Rename / Clean —
-     these only STAGE the operation and show a PREVIEW in the list.
+  1. Add images (whole folder, individual files, or drag & drop).
+     Images you already processed in the past show "done ✓" —
+     the app remembers them (~/.config/wallprep/processed.json).
+  2. Select rows and stage operations (preview only, nothing written):
+       Resize  -> longest side becomes the chosen size
+                  (1920 makes landscape 1920 wide, portrait 1920 tall)
+       Rename  -> random 5-character name
+       Clean   -> remove ALL metadata
      Click the same button again to un-stage.
-  3. Click GO — each image is processed ONCE, with all its staged
-     operations combined, into a single file in the output folder.
+  3. Click Apply — each image is processed ONCE into a single output
+     file, then the app VERIFIES the result (dimensions correct,
+     metadata gone) and shows a green check when it passes.
 
-The drawer on the right shows a preview thumbnail and the full
-metadata of the selected image.
-
-The output folder is remembered between sessions
-(config: ~/.config/wallprep/config.json).
-
-Originals are never modified.
+The drawer on the right shows a preview thumbnail and full metadata
+of the selected image. Output folder and width are remembered
+between sessions. Originals are never modified.
 
 Dependencies (Ubuntu):
   sudo apt install python3-gi gir1.2-gtk-3.0 imagemagick libimage-exiftool-perl
@@ -24,12 +26,14 @@ Run:
   python3 wallprep.py
 """
 
+import hashlib
 import json
 import random
 import shutil
 import string
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import gi
@@ -38,7 +42,9 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".webp"}
 NAME_LENGTH = 5
-CONFIG_FILE = Path.home() / ".config" / "wallprep" / "config.json"
+CONFIG_DIR = Path.home() / ".config" / "wallprep"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+PROCESSED_FILE = CONFIG_DIR / "processed.json"
 DEFAULT_OUTPUT = Path.home() / "wallpapers" / "ready"
 THUMB_WIDTH = 280
 
@@ -50,6 +56,11 @@ BORING_TAGS = {
     "EncodingProcess", "BitsPerSample", "ColorComponents", "YCbCrSubSampling",
     "JFIFVersion", "ResolutionUnit", "XResolution", "YResolution",
     "BitDepth", "ColorType", "Compression", "Filter", "Interlace",
+    # PNG color-calibration values (re-added by ImageMagick, harmless,
+    # present in virtually every PNG — not identifying metadata)
+    "WhitePointX", "WhitePointY", "RedX", "RedY", "GreenX", "GreenY",
+    "BlueX", "BlueY", "BackgroundColor", "Gamma", "SRGBRendering",
+    "PixelsPerUnitX", "PixelsPerUnitY", "PixelUnits",
 }
 
 AI_HINTS = ("software", "artist", "creator", "generator", "prompt", "stable",
@@ -60,35 +71,50 @@ COL_PATH, COL_NAME, COL_DIMS, COL_META, COL_STATUS = range(5)
 
 CSS = b"""
 treeview.file-list { font-size: 10.5px; }
-button.go-btn {
+button.apply-btn {
     background-image: none;
     background-color: #7c3aed;
     color: #ffffff;
     font-weight: bold;
     text-shadow: none;
     border-color: #6d28d9;
+    padding-left: 40px;
+    padding-right: 40px;
 }
-button.go-btn:hover { background-color: #8b5cf6; }
-button.go-btn:active { background-color: #6d28d9; }
-button.go-btn:disabled { background-color: #b9a7e8; color: #f3f0fa; }
+button.apply-btn:hover { background-color: #8b5cf6; }
+button.apply-btn:active { background-color: #6d28d9; }
+button.apply-btn:disabled { background-color: #b9a7e8; color: #f3f0fa; }
 """
 
 
-def load_config() -> dict:
+# ---------------- persistence helpers ----------------
+def load_json(path: Path) -> dict:
     try:
-        return json.loads(CONFIG_FILE.read_text())
+        return json.loads(path.read_text())
     except Exception:
         return {}
 
 
-def save_config(cfg: dict):
+def save_json(path: Path, data: dict):
     try:
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2))
     except Exception:
         pass
 
 
+def fingerprint(path: str) -> str:
+    """Content-based ID of a file: size + sha1 of the first 64 KB.
+    Survives the file being moved or its folder renamed."""
+    p = Path(path)
+    h = hashlib.sha1()
+    h.update(str(p.stat().st_size).encode())
+    with open(p, "rb") as f:
+        h.update(f.read(65536))
+    return h.hexdigest()
+
+
+# ---------------- image helpers ----------------
 def read_metadata(path: str) -> dict:
     try:
         out = subprocess.run(["exiftool", "-j", "-G0", path],
@@ -115,16 +141,23 @@ def random_name(length=NAME_LENGTH):
                                   k=length))
 
 
+def scaled_to_longest(w: int, h: int, target: int):
+    """New (w, h) so the LONGEST side equals target, aspect kept."""
+    longest = max(w, h)
+    scale = target / longest
+    return max(1, round(w * scale)), max(1, round(h * scale))
+
+
 class WallprepApp(Gtk.Window):
     def __init__(self):
         super().__init__(title="wallprep")
-        self.set_default_size(1080, 620)
-        self.cfg = load_config()
-        # per-file state: path -> {w, h, meta, resize_to, new_name, strip}
+        self.set_default_size(1080, 640)
+        self.cfg = load_json(CONFIG_FILE)
+        self.processed = load_json(PROCESSED_FILE)
+        # per-file state: path -> {w,h,meta,resize_to,new_name,strip,done}
         self.info = {}
         self.busy = False
 
-        # ---- CSS (small list text, purple GO button) ----
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_screen(
@@ -149,13 +182,6 @@ class WallprepApp(Gtk.Window):
         clear_btn.connect("clicked", self.on_clear)
         header.pack_start(clear_btn)
 
-        self.go_btn = Gtk.Button(label="GO")
-        self.go_btn.get_style_context().add_class("go-btn")
-        self.go_btn.set_tooltip_text(
-            "Apply all staged operations — one output file per image")
-        self.go_btn.connect("clicked", self.on_go)
-        header.pack_end(self.go_btn)
-
         self.drawer_btn = Gtk.ToggleButton()
         self.drawer_btn.set_image(Gtk.Image.new_from_icon_name(
             "view-dual-symbolic", Gtk.IconSize.BUTTON))
@@ -170,13 +196,22 @@ class WallprepApp(Gtk.Window):
                   "set_margin_start", "set_margin_end"):
             getattr(bar, m)(10)
 
-        # the three operation buttons, side by side
+        # Resize grouped with its size field
         self.resize_btn = Gtk.Button(label="Resize")
         self.resize_btn.set_tooltip_text(
-            "Stage a resize for the selected images (preview only — "
-            "nothing happens until GO)")
+            "Stage a resize: the LONGEST side becomes this size "
+            "(landscape -> width, portrait -> height). Preview only.")
         self.resize_btn.connect("clicked", self.on_stage_resize)
         bar.pack_start(self.resize_btn, False, False, 0)
+
+        self.width_spin = Gtk.SpinButton.new_with_range(480, 7680, 10)
+        self.width_spin.set_value(int(self.cfg.get("width", 1920)))
+        self.width_spin.set_tooltip_text("Target size of the longest side")
+        bar.pack_start(self.width_spin, False, False, 0)
+        bar.pack_start(Gtk.Label(label="px"), False, False, 0)
+
+        bar.pack_start(Gtk.Separator(
+            orientation=Gtk.Orientation.VERTICAL), False, False, 4)
 
         self.rename_btn = Gtk.Button(label="Rename")
         self.rename_btn.set_tooltip_text(
@@ -189,15 +224,6 @@ class WallprepApp(Gtk.Window):
             "Stage metadata removal (preview only)")
         self.clean_btn.connect("clicked", self.on_stage_clean)
         bar.pack_start(self.clean_btn, False, False, 0)
-
-        bar.pack_start(Gtk.Separator(
-            orientation=Gtk.Orientation.VERTICAL), False, False, 4)
-
-        bar.pack_start(Gtk.Label(label="Width:"), False, False, 0)
-        self.width_spin = Gtk.SpinButton.new_with_range(480, 7680, 10)
-        self.width_spin.set_value(int(self.cfg.get("width", 1920)))
-        bar.pack_start(self.width_spin, False, False, 0)
-        bar.pack_start(Gtk.Label(label="px"), False, False, 0)
 
         sel_all = Gtk.Button(label="Select all")
         sel_all.connect("clicked",
@@ -220,7 +246,7 @@ class WallprepApp(Gtk.Window):
             action=Gtk.FileChooserAction.SELECT_FOLDER)
         self.out_btn.set_filename(str(saved_out))
         self.out_btn.set_tooltip_text(
-            "GO saves processed copies here. Remembered between sessions.")
+            "Apply saves processed copies here. Remembered between sessions.")
         self.out_btn.connect("file-set", self.on_output_changed)
         out_row.pack_start(self.out_btn, True, True, 0)
 
@@ -296,11 +322,23 @@ class WallprepApp(Gtk.Window):
             orientation=Gtk.Orientation.VERTICAL), False, False, 0)
         main_h.pack_start(self.drawer, False, False, 0)
 
-        # ---------------- hint bar ----------------
+        # ---------------- bottom bar: Apply button ----------------
+        self.apply_btn = Gtk.Button(label="Apply")
+        self.apply_btn.get_style_context().add_class("apply-btn")
+        self.apply_btn.set_tooltip_text(
+            "Apply all staged operations — one output file per image, "
+            "then verify the result")
+        self.apply_btn.connect("clicked", self.on_apply)
+
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        bottom.set_margin_top(8)
+        bottom.set_margin_bottom(4)
+        bottom.set_center_widget(self.apply_btn)
+
         self.hint = Gtk.Label(
             label="Add images, select them, stage operations "
-                  "(Resize / Rename / Clean), then press GO.")
-        self.hint.set_margin_top(6)
+                  "(Resize / Rename / Clean), then press Apply.")
+        self.hint.set_margin_top(4)
         self.hint.set_margin_bottom(8)
         self.hint.get_style_context().add_class("dim-label")
 
@@ -308,6 +346,7 @@ class WallprepApp(Gtk.Window):
         vbox.pack_start(bar, False, False, 0)
         vbox.pack_start(out_row, False, False, 0)
         vbox.pack_start(main_h, True, True, 0)
+        vbox.pack_start(bottom, False, False, 0)
         vbox.pack_start(self.hint, False, False, 0)
         self.add(vbox)
         self.set_ops_sensitive(False)
@@ -317,12 +356,13 @@ class WallprepApp(Gtk.Window):
     # ================= config persistence =================
     def on_output_changed(self, _btn):
         self.cfg["output_dir"] = self.out_btn.get_filename()
-        save_config(self.cfg)
+        save_json(CONFIG_FILE, self.cfg)
 
     def on_destroy(self, _win):
         self.cfg["output_dir"] = self.out_btn.get_filename()
         self.cfg["width"] = int(self.width_spin.get_value())
-        save_config(self.cfg)
+        save_json(CONFIG_FILE, self.cfg)
+        save_json(PROCESSED_FILE, self.processed)
         Gtk.main_quit()
 
     # ================= adding files =================
@@ -373,13 +413,13 @@ class WallprepApp(Gtk.Window):
         for p in new:
             self.info[p] = {"w": None, "h": None, "meta": {},
                             "resize_to": None, "new_name": None,
-                            "strip": False}
+                            "strip": False, "done": None}
             self.store.append([p, Path(p).name, "…", "…", ""])
         if new:
             self.set_ops_sensitive(True)
             self.hint.set_label(
                 f"{len(self.store)} image(s) loaded. Stage operations, "
-                "then press GO.")
+                "then press Apply.")
             threading.Thread(target=self._scan, args=(new,),
                              daemon=True).start()
 
@@ -396,7 +436,14 @@ class WallprepApp(Gtk.Window):
         for p in paths:
             w, h = image_dimensions(p)
             meta = read_metadata(p)
-            self.info[p].update(w=w, h=h, meta=meta)
+            done = None
+            try:
+                rec = self.processed.get(fingerprint(p))
+                if rec:
+                    done = rec.get("output", "yes")
+            except Exception:
+                pass
+            self.info[p].update(w=w, h=h, meta=meta, done=done)
             GLib.idle_add(self._refresh_row, p)
 
     # ================= row display =================
@@ -427,13 +474,18 @@ class WallprepApp(Gtk.Window):
         staged = [s for s, on in (("resize", st["resize_to"]),
                                   ("rename", st["new_name"]),
                                   ("clean", st["strip"])) if on]
-        status = "staged: " + "+".join(staged) if staged else ""
+        if staged:
+            status = "staged: " + "+".join(staged)
+        elif st["done"]:
+            status = f"done ✓ ({st['done']})"
+        else:
+            status = ""
         for row in self.store:
             if row[COL_PATH] == path:
                 row[COL_NAME] = name
                 row[COL_DIMS] = dims
                 row[COL_META] = meta_lbl
-                if not row[COL_STATUS].startswith(("✓", "error")):
+                if not row[COL_STATUS].startswith(("✓", "⚠", "error")):
                     row[COL_STATUS] = status
                 elif staged:
                     row[COL_STATUS] = status
@@ -454,7 +506,6 @@ class WallprepApp(Gtk.Window):
         path = model[tree_paths[-1]][COL_PATH]
         st = self.info.get(path, {})
         self.drawer_title.set_label(Path(path).name)
-        # metadata table
         self.meta_store.clear()
         meta = st.get("meta", {})
         if not meta:
@@ -462,7 +513,6 @@ class WallprepApp(Gtk.Window):
         else:
             for k, v in sorted(meta.items()):
                 self.meta_store.append([k, str(v)])
-        # thumbnail, loaded off the main thread
         threading.Thread(target=self._load_thumb, args=(path,),
                          daemon=True).start()
 
@@ -475,7 +525,6 @@ class WallprepApp(Gtk.Window):
         GLib.idle_add(self._set_thumb, path, pb)
 
     def _set_thumb(self, path, pb):
-        # only apply if this row is still the focused one
         model, tree_paths = self.tree.get_selection().get_selected_rows()
         if tree_paths and model[tree_paths[-1]][COL_PATH] == path:
             if pb:
@@ -489,7 +538,7 @@ class WallprepApp(Gtk.Window):
 
     def set_ops_sensitive(self, state):
         for b in (self.resize_btn, self.rename_btn,
-                  self.clean_btn, self.go_btn):
+                  self.clean_btn, self.apply_btn):
             b.set_sensitive(state)
 
     def output_dir(self):
@@ -500,7 +549,7 @@ class WallprepApp(Gtk.Window):
 
     # ================= staging (preview only) =================
     def on_stage_resize(self, _btn):
-        width = int(self.width_spin.get_value())
+        target = int(self.width_spin.get_value())
         paths = self.selected_paths()
         all_staged = all(self.info[p]["resize_to"] for p in paths)
         for p in paths:
@@ -508,8 +557,7 @@ class WallprepApp(Gtk.Window):
             if all_staged:
                 st["resize_to"] = None
             elif st["w"]:
-                nh = max(1, round(st["h"] * width / st["w"]))
-                st["resize_to"] = (width, nh)
+                st["resize_to"] = scaled_to_longest(st["w"], st["h"], target)
             GLib.idle_add(self._refresh_row, p)
         self._staging_hint()
 
@@ -545,13 +593,13 @@ class WallprepApp(Gtk.Window):
         n = sum(1 for st in self.info.values()
                 if st["resize_to"] or st["new_name"] or st["strip"])
         self.hint.set_label(
-            f"{n} image(s) have staged operations — press GO to apply. "
+            f"{n} image(s) have staged operations — press Apply. "
             "Nothing is written until then." if n else
             "No operations staged. Select images and stage with "
             "Resize / Rename / Clean.")
 
-    # ================= GO =================
-    def on_go(self, _btn):
+    # ================= Apply =================
+    def on_apply(self, _btn):
         if self.busy:
             return
         jobs = [(p, dict(self.info[p])) for p in self.selected_paths()
@@ -560,31 +608,47 @@ class WallprepApp(Gtk.Window):
         if not jobs:
             self.hint.set_label(
                 "Nothing staged — click Resize / Rename / Clean first "
-                "to preview, then GO.")
+                "to preview, then Apply.")
             return
         out = self.output_dir()
         self.busy = True
         self.set_ops_sensitive(False)
-        threading.Thread(target=self._go_all, args=(jobs, out),
+        threading.Thread(target=self._apply_all, args=(jobs, out),
                          daemon=True).start()
 
-    def _go_all(self, jobs, out):
+    def _apply_all(self, jobs, out):
         ok = 0
         for path, st in jobs:
             GLib.idle_add(self._set_status, path, "working…")
             try:
-                dest = self._go_one(Path(path), st, out)
-                ok += 1
-                self.info[path].update(resize_to=None, new_name=None,
-                                       strip=False)
-                GLib.idle_add(self._refresh_row, path)
-                GLib.idle_add(self._set_status, path, f"✓ → {dest.name}")
+                dest = self._apply_one(Path(path), st, out)
+                GLib.idle_add(self._set_status, path, "verifying…")
+                verified, problem = self._verify(dest, st)
+                if verified:
+                    ok += 1
+                    # remember this source file as processed
+                    try:
+                        self.processed[fingerprint(path)] = {
+                            "output": dest.name,
+                            "date": time.strftime("%Y-%m-%d %H:%M"),
+                        }
+                        save_json(PROCESSED_FILE, self.processed)
+                    except Exception:
+                        pass
+                    self.info[path].update(resize_to=None, new_name=None,
+                                           strip=False, done=dest.name)
+                    GLib.idle_add(self._refresh_row, path)
+                    GLib.idle_add(self._set_status, path,
+                                  f"✅ verified → {dest.name}")
+                else:
+                    GLib.idle_add(self._set_status, path,
+                                  f"⚠ check failed: {problem}")
             except Exception as e:
                 GLib.idle_add(self._set_status, path,
                               f"error: {e.__class__.__name__}")
         GLib.idle_add(self._done, ok, len(jobs), out)
 
-    def _go_one(self, src: Path, st: dict, out: Path) -> Path:
+    def _apply_one(self, src: Path, st: dict, out: Path) -> Path:
         # decide the output name (ONE file per image)
         if st["new_name"]:
             dest = out / st["new_name"]
@@ -613,6 +677,26 @@ class WallprepApp(Gtk.Window):
                            check=True, capture_output=True, timeout=60)
         return dest
 
+    def _verify(self, dest: Path, st: dict):
+        """Independently re-check the output file against what was staged."""
+        if not dest.exists():
+            return False, "output file missing"
+        if st["resize_to"]:
+            w, h = image_dimensions(str(dest))
+            if (w, h) != tuple(st["resize_to"]):
+                return False, f"size is {w}×{h}, expected " \
+                              f"{st['resize_to'][0]}×{st['resize_to'][1]}"
+        if st["strip"]:
+            leftover = read_metadata(str(dest))
+            # ICC color profiles are harmless; flag anything else
+            suspicious = {k: v for k, v in leftover.items()
+                          if not k.lower().startswith("icc")}
+            if suspicious:
+                return False, f"{len(suspicious)} metadata tag(s) remain"
+        if st["new_name"] and dest.suffix.lower() not in SUPPORTED:
+            return False, "unexpected file extension"
+        return True, ""
+
     def _set_status(self, path, status):
         for row in self.store:
             if row[COL_PATH] == path:
@@ -622,8 +706,9 @@ class WallprepApp(Gtk.Window):
     def _done(self, ok, total, out):
         self.busy = False
         self.set_ops_sensitive(True)
-        self.hint.set_label(f"Done — {ok}/{total} file(s) written to {out} "
-                            "(one output per image, originals untouched)")
+        self.hint.set_label(
+            f"Done — {ok}/{total} file(s) written to {out} and verified "
+            "(originals untouched)")
         return False
 
     # ================= misc =================
