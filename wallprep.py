@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-wallprep — prepare wallpapers for publishing (GTK GUI, v4)
+wallprep — prepare wallpapers for publishing (GTK GUI, v5)
 
 Workflow:
-  1. Add images (whole folder or individual files, or drag & drop)
-  2. Select rows and click Resize / Rename / Strip metadata —
-     these only STAGE the operation and show a PREVIEW in the list
-     (e.g. "3000×2000 → 1920×1280"). Click again to un-stage.
-  3. Click DO — each image is processed ONCE, with all its staged
-     operations combined, into a single output file.
+  1. Add images (whole folder, individual files, or drag & drop)
+  2. Select rows and click Resize / Rename / Clean —
+     these only STAGE the operation and show a PREVIEW in the list.
+     Click the same button again to un-stage.
+  3. Click GO — each image is processed ONCE, with all its staged
+     operations combined, into a single file in the output folder.
 
-A side drawer (toggle in the header bar, or just select a row) shows
-the full metadata of the selected image.
+The drawer on the right shows a preview thumbnail and the full
+metadata of the selected image.
 
-Originals are never modified — DO writes copies to the output folder.
+The output folder is remembered between sessions
+(config: ~/.config/wallprep/config.json).
+
+Originals are never modified.
 
 Dependencies (Ubuntu):
   sudo apt install python3-gi gir1.2-gtk-3.0 imagemagick libimage-exiftool-perl
@@ -31,11 +34,13 @@ from pathlib import Path
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GLib, Gdk
+from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".webp"}
 NAME_LENGTH = 5
+CONFIG_FILE = Path.home() / ".config" / "wallprep" / "config.json"
 DEFAULT_OUTPUT = Path.home() / "wallpapers" / "ready"
+THUMB_WIDTH = 280
 
 BORING_TAGS = {
     "SourceFile", "ExifToolVersion", "FileName", "Directory", "FileSize",
@@ -52,6 +57,36 @@ AI_HINTS = ("software", "artist", "creator", "generator", "prompt", "stable",
             "usercomment", "description", "model")
 
 COL_PATH, COL_NAME, COL_DIMS, COL_META, COL_STATUS = range(5)
+
+CSS = b"""
+treeview.file-list { font-size: 10.5px; }
+button.go-btn {
+    background-image: none;
+    background-color: #7c3aed;
+    color: #ffffff;
+    font-weight: bold;
+    text-shadow: none;
+    border-color: #6d28d9;
+}
+button.go-btn:hover { background-color: #8b5cf6; }
+button.go-btn:active { background-color: #6d28d9; }
+button.go-btn:disabled { background-color: #b9a7e8; color: #f3f0fa; }
+"""
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_config(cfg: dict):
+    try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    except Exception:
+        pass
 
 
 def read_metadata(path: str) -> dict:
@@ -83,10 +118,18 @@ def random_name(length=NAME_LENGTH):
 class WallprepApp(Gtk.Window):
     def __init__(self):
         super().__init__(title="wallprep")
-        self.set_default_size(1040, 600)
+        self.set_default_size(1080, 620)
+        self.cfg = load_config()
         # per-file state: path -> {w, h, meta, resize_to, new_name, strip}
         self.info = {}
         self.busy = False
+
+        # ---- CSS (small list text, purple GO button) ----
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         # ---------------- header bar ----------------
         header = Gtk.HeaderBar(title="wallprep", show_close_button=True)
@@ -106,17 +149,17 @@ class WallprepApp(Gtk.Window):
         clear_btn.connect("clicked", self.on_clear)
         header.pack_start(clear_btn)
 
-        self.do_btn = Gtk.Button(label="DO")
-        self.do_btn.get_style_context().add_class("suggested-action")
-        self.do_btn.set_tooltip_text(
+        self.go_btn = Gtk.Button(label="GO")
+        self.go_btn.get_style_context().add_class("go-btn")
+        self.go_btn.set_tooltip_text(
             "Apply all staged operations — one output file per image")
-        self.do_btn.connect("clicked", self.on_do)
-        header.pack_end(self.do_btn)
+        self.go_btn.connect("clicked", self.on_go)
+        header.pack_end(self.go_btn)
 
         self.drawer_btn = Gtk.ToggleButton()
         self.drawer_btn.set_image(Gtk.Image.new_from_icon_name(
             "view-dual-symbolic", Gtk.IconSize.BUTTON))
-        self.drawer_btn.set_tooltip_text("Show/hide metadata drawer")
+        self.drawer_btn.set_tooltip_text("Show/hide preview drawer")
         self.drawer_btn.set_active(True)
         self.drawer_btn.connect("toggled", self.on_drawer_toggle)
         header.pack_end(self.drawer_btn)
@@ -127,26 +170,13 @@ class WallprepApp(Gtk.Window):
                   "set_margin_start", "set_margin_end"):
             getattr(bar, m)(10)
 
+        # the three operation buttons, side by side
         self.resize_btn = Gtk.Button(label="Resize")
         self.resize_btn.set_tooltip_text(
             "Stage a resize for the selected images (preview only — "
-            "nothing is written until DO)")
+            "nothing happens until GO)")
         self.resize_btn.connect("clicked", self.on_stage_resize)
         bar.pack_start(self.resize_btn, False, False, 0)
-
-        self.width_spin = Gtk.SpinButton.new_with_range(480, 7680, 10)
-        self.width_spin.set_value(1920)
-        bar.pack_start(self.width_spin, False, False, 0)
-        bar.pack_start(Gtk.Label(label="px"), False, False, 0)
-
-        self.upscale_check = Gtk.CheckButton(label="Allow upscaling")
-        self.upscale_check.set_tooltip_text(
-            "If checked, smaller images are enlarged to the target width "
-            "(can look soft/blurry)")
-        bar.pack_start(self.upscale_check, False, False, 0)
-
-        bar.pack_start(Gtk.Separator(
-            orientation=Gtk.Orientation.VERTICAL), False, False, 4)
 
         self.rename_btn = Gtk.Button(label="Rename")
         self.rename_btn.set_tooltip_text(
@@ -154,11 +184,20 @@ class WallprepApp(Gtk.Window):
         self.rename_btn.connect("clicked", self.on_stage_rename)
         bar.pack_start(self.rename_btn, False, False, 0)
 
-        self.strip_btn = Gtk.Button(label="Strip metadata")
-        self.strip_btn.set_tooltip_text(
+        self.clean_btn = Gtk.Button(label="Clean")
+        self.clean_btn.set_tooltip_text(
             "Stage metadata removal (preview only)")
-        self.strip_btn.connect("clicked", self.on_stage_strip)
-        bar.pack_start(self.strip_btn, False, False, 0)
+        self.clean_btn.connect("clicked", self.on_stage_clean)
+        bar.pack_start(self.clean_btn, False, False, 0)
+
+        bar.pack_start(Gtk.Separator(
+            orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+
+        bar.pack_start(Gtk.Label(label="Width:"), False, False, 0)
+        self.width_spin = Gtk.SpinButton.new_with_range(480, 7680, 10)
+        self.width_spin.set_value(int(self.cfg.get("width", 1920)))
+        bar.pack_start(self.width_spin, False, False, 0)
+        bar.pack_start(Gtk.Label(label="px"), False, False, 0)
 
         sel_all = Gtk.Button(label="Select all")
         sel_all.connect("clicked",
@@ -174,13 +213,15 @@ class WallprepApp(Gtk.Window):
         out_label.set_markup("<b>Output folder:</b>")
         out_row.pack_start(out_label, False, False, 0)
 
+        saved_out = Path(self.cfg.get("output_dir", str(DEFAULT_OUTPUT)))
+        saved_out.mkdir(parents=True, exist_ok=True)
         self.out_btn = Gtk.FileChooserButton(
             title="Choose output folder (use 'Create Folder' for a new one)",
             action=Gtk.FileChooserAction.SELECT_FOLDER)
-        DEFAULT_OUTPUT.mkdir(parents=True, exist_ok=True)
-        self.out_btn.set_filename(str(DEFAULT_OUTPUT))
+        self.out_btn.set_filename(str(saved_out))
         self.out_btn.set_tooltip_text(
-            "DO saves processed copies here. Originals are never modified.")
+            "GO saves processed copies here. Remembered between sessions.")
+        self.out_btn.connect("file-set", self.on_output_changed)
         out_row.pack_start(self.out_btn, True, True, 0)
 
         open_out = Gtk.Button.new_from_icon_name(
@@ -192,14 +233,14 @@ class WallprepApp(Gtk.Window):
         # ---------------- file list ----------------
         self.store = Gtk.ListStore(str, str, str, str, str)
         self.tree = Gtk.TreeView(model=self.store)
+        self.tree.get_style_context().add_class("file-list")
         self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self.tree.get_selection().connect("changed", self.on_selection_changed)
-        for i, (title, expand) in enumerate(
-                [("File", True), ("Dimensions", False),
-                 ("Metadata", False), ("Status", False)]):
+        for i, title in enumerate(("File", "Dimensions",
+                                   "Metadata", "Status")):
             col = Gtk.TreeViewColumn(title, Gtk.CellRendererText(),
                                      text=i + 1)
-            col.set_expand(expand)
+            col.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
             col.set_resizable(True)
             self.tree.append_column(col)
 
@@ -212,18 +253,21 @@ class WallprepApp(Gtk.Window):
         list_scroll.set_vexpand(True)
         list_scroll.add(self.tree)
 
-        # ---------------- metadata drawer (right side) ----------------
-        self.drawer_title = Gtk.Label(label="Metadata")
+        # ---------------- drawer: thumbnail + metadata ----------------
+        self.drawer_title = Gtk.Label(label="Preview")
         self.drawer_title.set_margin_top(8)
         self.drawer_title.set_margin_bottom(4)
         self.drawer_title.set_ellipsize(3)  # Pango.EllipsizeMode.END
 
+        self.thumb = Gtk.Image()
+        self.thumb.set_margin_bottom(6)
+
         self.meta_store = Gtk.ListStore(str, str)
         meta_tree = Gtk.TreeView(model=self.meta_store)
-        meta_tree.set_headers_visible(True)
+        meta_tree.get_style_context().add_class("file-list")
         for i, title in enumerate(("Tag", "Value")):
             r = Gtk.CellRendererText()
-            r.set_property("wrap-width", 180)
+            r.set_property("wrap-width", 150)
             r.set_property("wrap-mode", 2)  # Pango.WrapMode.WORD_CHAR
             c = Gtk.TreeViewColumn(title, r, text=i)
             c.set_resizable(True)
@@ -234,6 +278,7 @@ class WallprepApp(Gtk.Window):
 
         drawer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         drawer_box.pack_start(self.drawer_title, False, False, 0)
+        drawer_box.pack_start(self.thumb, False, False, 0)
         drawer_box.pack_start(Gtk.Separator(
             orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
         drawer_box.pack_start(meta_scroll, True, True, 0)
@@ -243,18 +288,18 @@ class WallprepApp(Gtk.Window):
             Gtk.RevealerTransitionType.SLIDE_LEFT)
         self.drawer.set_reveal_child(True)
         self.drawer.add(drawer_box)
-        self.drawer.set_size_request(320, -1)
+        self.drawer.set_size_request(THUMB_WIDTH + 40, -1)
 
-        paned = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        paned.pack_start(list_scroll, True, True, 0)
-        paned.pack_start(Gtk.Separator(
+        main_h = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        main_h.pack_start(list_scroll, True, True, 0)
+        main_h.pack_start(Gtk.Separator(
             orientation=Gtk.Orientation.VERTICAL), False, False, 0)
-        paned.pack_start(self.drawer, False, False, 0)
+        main_h.pack_start(self.drawer, False, False, 0)
 
         # ---------------- hint bar ----------------
         self.hint = Gtk.Label(
-            label="Add images, select them, stage operations with the "
-                  "buttons (preview only), then press DO.")
+            label="Add images, select them, stage operations "
+                  "(Resize / Rename / Clean), then press GO.")
         self.hint.set_margin_top(6)
         self.hint.set_margin_bottom(8)
         self.hint.get_style_context().add_class("dim-label")
@@ -262,10 +307,23 @@ class WallprepApp(Gtk.Window):
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         vbox.pack_start(bar, False, False, 0)
         vbox.pack_start(out_row, False, False, 0)
-        vbox.pack_start(paned, True, True, 0)
+        vbox.pack_start(main_h, True, True, 0)
         vbox.pack_start(self.hint, False, False, 0)
         self.add(vbox)
         self.set_ops_sensitive(False)
+
+        self.connect("destroy", self.on_destroy)
+
+    # ================= config persistence =================
+    def on_output_changed(self, _btn):
+        self.cfg["output_dir"] = self.out_btn.get_filename()
+        save_config(self.cfg)
+
+    def on_destroy(self, _win):
+        self.cfg["output_dir"] = self.out_btn.get_filename()
+        self.cfg["width"] = int(self.width_spin.get_value())
+        save_config(self.cfg)
+        Gtk.main_quit()
 
     # ================= adding files =================
     def on_add_folder(self, _btn):
@@ -321,7 +379,7 @@ class WallprepApp(Gtk.Window):
             self.set_ops_sensitive(True)
             self.hint.set_label(
                 f"{len(self.store)} image(s) loaded. Stage operations, "
-                "then press DO.")
+                "then press GO.")
             threading.Thread(target=self._scan, args=(new,),
                              daemon=True).start()
 
@@ -329,7 +387,8 @@ class WallprepApp(Gtk.Window):
         self.store.clear()
         self.info.clear()
         self.meta_store.clear()
-        self.drawer_title.set_label("Metadata")
+        self.thumb.clear()
+        self.drawer_title.set_label("Preview")
         self.set_ops_sensitive(False)
         self.hint.set_label("List cleared. Add a folder or images to start.")
 
@@ -367,7 +426,7 @@ class WallprepApp(Gtk.Window):
             meta_lbl += "  →  clean"
         staged = [s for s, on in (("resize", st["resize_to"]),
                                   ("rename", st["new_name"]),
-                                  ("strip", st["strip"])) if on]
+                                  ("clean", st["strip"])) if on]
         status = "staged: " + "+".join(staged) if staged else ""
         for row in self.store:
             if row[COL_PATH] == path:
@@ -378,6 +437,7 @@ class WallprepApp(Gtk.Window):
                     row[COL_STATUS] = status
                 elif staged:
                     row[COL_STATUS] = status
+        self.tree.columns_autosize()
         return False
 
     # ================= selection / drawer =================
@@ -394,6 +454,7 @@ class WallprepApp(Gtk.Window):
         path = model[tree_paths[-1]][COL_PATH]
         st = self.info.get(path, {})
         self.drawer_title.set_label(Path(path).name)
+        # metadata table
         self.meta_store.clear()
         meta = st.get("meta", {})
         if not meta:
@@ -401,24 +462,45 @@ class WallprepApp(Gtk.Window):
         else:
             for k, v in sorted(meta.items()):
                 self.meta_store.append([k, str(v)])
+        # thumbnail, loaded off the main thread
+        threading.Thread(target=self._load_thumb, args=(path,),
+                         daemon=True).start()
+
+    def _load_thumb(self, path):
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                path, THUMB_WIDTH, THUMB_WIDTH, True)
+        except Exception:
+            pb = None
+        GLib.idle_add(self._set_thumb, path, pb)
+
+    def _set_thumb(self, path, pb):
+        # only apply if this row is still the focused one
+        model, tree_paths = self.tree.get_selection().get_selected_rows()
+        if tree_paths and model[tree_paths[-1]][COL_PATH] == path:
+            if pb:
+                self.thumb.set_from_pixbuf(pb)
+            else:
+                self.thumb.clear()
+        return False
 
     def on_drawer_toggle(self, btn):
         self.drawer.set_reveal_child(btn.get_active())
 
     def set_ops_sensitive(self, state):
         for b in (self.resize_btn, self.rename_btn,
-                  self.strip_btn, self.do_btn):
+                  self.clean_btn, self.go_btn):
             b.set_sensitive(state)
 
     def output_dir(self):
-        out = Path(self.out_btn.get_filename() or DEFAULT_OUTPUT)
+        out = Path(self.out_btn.get_filename()
+                   or self.cfg.get("output_dir", str(DEFAULT_OUTPUT)))
         out.mkdir(parents=True, exist_ok=True)
         return out
 
     # ================= staging (preview only) =================
     def on_stage_resize(self, _btn):
         width = int(self.width_spin.get_value())
-        upscale = self.upscale_check.get_active()
         paths = self.selected_paths()
         all_staged = all(self.info[p]["resize_to"] for p in paths)
         for p in paths:
@@ -426,11 +508,8 @@ class WallprepApp(Gtk.Window):
             if all_staged:
                 st["resize_to"] = None
             elif st["w"]:
-                if st["w"] > width or upscale:
-                    nh = max(1, round(st["h"] * width / st["w"]))
-                    st["resize_to"] = (width, nh)
-                else:
-                    st["resize_to"] = (st["w"], st["h"])  # no change
+                nh = max(1, round(st["h"] * width / st["w"]))
+                st["resize_to"] = (width, nh)
             GLib.idle_add(self._refresh_row, p)
         self._staging_hint()
 
@@ -454,7 +533,7 @@ class WallprepApp(Gtk.Window):
             GLib.idle_add(self._refresh_row, p)
         self._staging_hint()
 
-    def on_stage_strip(self, _btn):
+    def on_stage_clean(self, _btn):
         paths = self.selected_paths()
         all_staged = all(self.info[p]["strip"] for p in paths)
         for p in paths:
@@ -466,14 +545,13 @@ class WallprepApp(Gtk.Window):
         n = sum(1 for st in self.info.values()
                 if st["resize_to"] or st["new_name"] or st["strip"])
         self.hint.set_label(
-            f"{n} image(s) have staged operations — press DO to apply. "
-            "Nothing is written until then. Click a button again to "
-            "un-stage." if n else
-            "No operations staged. Select images and stage with the "
-            "buttons above.")
+            f"{n} image(s) have staged operations — press GO to apply. "
+            "Nothing is written until then." if n else
+            "No operations staged. Select images and stage with "
+            "Resize / Rename / Clean.")
 
-    # ================= DO =================
-    def on_do(self, _btn):
+    # ================= GO =================
+    def on_go(self, _btn):
         if self.busy:
             return
         jobs = [(p, dict(self.info[p])) for p in self.selected_paths()
@@ -481,23 +559,22 @@ class WallprepApp(Gtk.Window):
                 or self.info[p]["strip"]]
         if not jobs:
             self.hint.set_label(
-                "Nothing staged — click Resize / Rename / Strip metadata "
-                "first to preview, then DO.")
+                "Nothing staged — click Resize / Rename / Clean first "
+                "to preview, then GO.")
             return
         out = self.output_dir()
         self.busy = True
         self.set_ops_sensitive(False)
-        threading.Thread(target=self._do_all, args=(jobs, out),
+        threading.Thread(target=self._go_all, args=(jobs, out),
                          daemon=True).start()
 
-    def _do_all(self, jobs, out):
+    def _go_all(self, jobs, out):
         ok = 0
         for path, st in jobs:
             GLib.idle_add(self._set_status, path, "working…")
             try:
-                dest = self._do_one(Path(path), st, out)
+                dest = self._go_one(Path(path), st, out)
                 ok += 1
-                # clear staged ops for this file
                 self.info[path].update(resize_to=None, new_name=None,
                                        strip=False)
                 GLib.idle_add(self._refresh_row, path)
@@ -507,7 +584,7 @@ class WallprepApp(Gtk.Window):
                               f"error: {e.__class__.__name__}")
         GLib.idle_add(self._done, ok, len(jobs), out)
 
-    def _do_one(self, src: Path, st: dict, out: Path) -> Path:
+    def _go_one(self, src: Path, st: dict, out: Path) -> Path:
         # decide the output name (ONE file per image)
         if st["new_name"]:
             dest = out / st["new_name"]
@@ -529,7 +606,7 @@ class WallprepApp(Gtk.Window):
                            check=True, capture_output=True, timeout=120)
         else:
             shutil.copy2(src, dest)
-        # strip metadata
+        # clean metadata
         if st["strip"]:
             subprocess.run(["exiftool", "-all=", "-overwrite_original",
                             "-quiet", str(dest)],
@@ -556,6 +633,5 @@ class WallprepApp(Gtk.Window):
 
 if __name__ == "__main__":
     win = WallprepApp()
-    win.connect("destroy", Gtk.main_quit)
     win.show_all()
     Gtk.main()
