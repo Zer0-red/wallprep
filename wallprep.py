@@ -28,6 +28,7 @@ Run:
 
 import hashlib
 import json
+import os
 import random
 import shutil
 import string
@@ -773,16 +774,30 @@ class WallprepApp(Gtk.Window):
         if st["resize_to"] and (st["resize_to"][0] != st["w"]
                                 or st["resize_to"][1] != st["h"]):
             geometry = f"{st['resize_to'][0]}x{st['resize_to'][1]}!"
+            strip_flag = ["-strip"] if st["strip"] else []
             subprocess.run(["convert", str(src), "-resize", geometry,
-                            str(dest)],
+                            *strip_flag, str(dest)],
                            check=True, capture_output=True, timeout=120)
         else:
             shutil.copy2(src, dest)
-        # clean metadata
+        # clean metadata (deep clean: all tags + ICC profile)
         if st["strip"]:
+            # -all= removes every metadata tag; ICC profiles are a separate
+            # group exiftool also drops with -all=, but we pass it through
+            # convert too so the pixel encoder fingerprint is rewritten even
+            # on a Clean-only run (no resize).
+            if not (st["resize_to"] and (st["resize_to"][0] != st["w"]
+                                         or st["resize_to"][1] != st["h"])):
+                # no resize happened, so dest is still a byte copy of src —
+                # re-encode it in place to scrub encoder traces
+                subprocess.run(["convert", str(dest), "-strip", str(dest)],
+                               check=True, capture_output=True, timeout=120)
             subprocess.run(["exiftool", "-all=", "-overwrite_original",
                             "-quiet", str(dest)],
                            check=True, capture_output=True, timeout=60)
+            # normalize timestamps so the original creation time doesn't leak
+            now = time.time()
+            os.utime(dest, (now, now))
         return dest
 
     def _verify(self, dest: Path, st: dict):
@@ -796,11 +811,14 @@ class WallprepApp(Gtk.Window):
                               f"{st['resize_to'][0]}×{st['resize_to'][1]}"
         if st["strip"]:
             leftover = read_metadata(str(dest))
-            # ICC color profiles are harmless; flag anything else
-            suspicious = {k: v for k, v in leftover.items()
-                          if not k.lower().startswith("icc")}
-            if suspicious:
-                return False, f"{len(suspicious)} metadata tag(s) remain"
+            if leftover:
+                return False, f"{len(leftover)} metadata tag(s) remain"
+            # confirm the ICC profile was removed too
+            icc = subprocess.run(
+                ["exiftool", "-ICC_Profile:all", str(dest)],
+                capture_output=True, text=True, timeout=30)
+            if icc.stdout.strip():
+                return False, "ICC color profile remains"
         if st["new_name"] and dest.suffix.lower() not in SUPPORTED:
             return False, "unexpected file extension"
         return True, ""
