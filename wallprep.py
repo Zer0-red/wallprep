@@ -223,11 +223,27 @@ class WallprepApp(Gtk.Window):
         self.resize_btn.connect("clicked", self.on_stage_resize)
         bar.pack_start(self.resize_btn, False, False, 0)
 
+        # resolution presets (value = longest side)
+        self.presets = [("720p (HD)", 1280), ("1080p (FHD)", 1920),
+                        ("1440p (QHD)", 2560), ("4K UHD", 3840),
+                        ("8K UHD", 7680), ("Custom", None)]
+        self.preset_combo = Gtk.ComboBoxText()
+        for label, _v in self.presets:
+            self.preset_combo.append_text(label)
+        self.preset_combo.set_tooltip_text("Common resolutions")
+        bar.pack_start(self.preset_combo, False, False, 0)
+
         self.width_spin = Gtk.SpinButton.new_with_range(480, 7680, 10)
         self.width_spin.set_value(int(self.cfg.get("width", 1920)))
         self.width_spin.set_tooltip_text("Target size of the longest side")
         bar.pack_start(self.width_spin, False, False, 0)
         bar.pack_start(Gtk.Label(label="px"), False, False, 0)
+
+        # keep combo and spinner in sync (guard against signal loops)
+        self._syncing = False
+        self._sync_preset_combo()
+        self.preset_combo.connect("changed", self.on_preset_changed)
+        self.width_spin.connect("value-changed", self.on_width_changed)
 
         bar.pack_start(Gtk.Separator(
             orientation=Gtk.Orientation.VERTICAL), False, False, 4)
@@ -237,6 +253,13 @@ class WallprepApp(Gtk.Window):
             "Stage Clean + Rename + Resize together (preview only)")
         self.all_btn.connect("clicked", self.on_stage_all)
         bar.pack_start(self.all_btn, False, False, 0)
+
+        self.reset_btn = Gtk.Button(label="Reset status")
+        self.reset_btn.set_tooltip_text(
+            "Clear staged operations AND the remembered 'done' state of "
+            "the selected images, so they can be processed fresh")
+        self.reset_btn.connect("clicked", self.on_reset_status)
+        bar.pack_end(self.reset_btn, False, False, 0)
 
         sel_all = Gtk.Button(label="Select all")
         sel_all.connect("clicked",
@@ -564,6 +587,51 @@ class WallprepApp(Gtk.Window):
                    or self.cfg.get("output_dir", str(DEFAULT_OUTPUT)))
         out.mkdir(parents=True, exist_ok=True)
         return out
+
+    # ================= presets / reset =================
+    def _sync_preset_combo(self):
+        """Point the combo at the preset matching the spinner, or Custom."""
+        self._syncing = True
+        val = int(self.width_spin.get_value())
+        idx = next((i for i, (_l, v) in enumerate(self.presets)
+                    if v == val), len(self.presets) - 1)
+        self.preset_combo.set_active(idx)
+        self._syncing = False
+
+    def on_preset_changed(self, combo):
+        if self._syncing:
+            return
+        idx = combo.get_active()
+        if idx < 0:
+            return
+        value = self.presets[idx][1]
+        if value is not None:
+            self._syncing = True
+            self.width_spin.set_value(value)
+            self._syncing = False
+
+    def on_width_changed(self, _spin):
+        if self._syncing:
+            return
+        self._sync_preset_combo()
+
+    def on_reset_status(self, _btn):
+        paths = self.selected_paths()
+        for p in paths:
+            st = self.info.get(p)
+            if not st:
+                continue
+            st.update(resize_to=None, new_name=None, strip=False, done=None)
+            try:
+                self.processed.pop(fingerprint(p), None)
+            except Exception:
+                pass
+            self._set_status(p, "")
+            GLib.idle_add(self._refresh_row, p)
+        save_json(PROCESSED_FILE, self.processed)
+        self.hint.set_label(
+            f"Status reset for {len(paths)} image(s) — staged operations "
+            "and 'done' memory cleared.")
 
     # ================= staging (preview only) =================
     def on_stage_resize(self, _btn):
