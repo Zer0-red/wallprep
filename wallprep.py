@@ -227,13 +227,13 @@ class WallprepApp(Gtk.Window):
         header = Gtk.HeaderBar(title="wallprep", show_close_button=True)
         self.set_titlebar(header)
 
-        add_files = Gtk.Button(label="Add images…")
-        add_files.connect("clicked", self.on_add_files)
-        header.pack_start(add_files)
-
         add_folder = Gtk.Button(label="Add folder…")
         add_folder.connect("clicked", self.on_add_folder)
         header.pack_start(add_folder)
+
+        add_files = Gtk.Button(label="Add images…")
+        add_files.connect("clicked", self.on_add_files)
+        header.pack_start(add_files)
 
         clear_btn = Gtk.Button.new_from_icon_name(
             "edit-clear-all-symbolic", Gtk.IconSize.BUTTON)
@@ -241,24 +241,13 @@ class WallprepApp(Gtk.Window):
         clear_btn.connect("clicked", self.on_clear)
         header.pack_start(clear_btn)
 
-        # small gap, then list/log management
-        gap = Gtk.Box()
-        gap.set_size_request(24, 1)
-        header.pack_start(gap)
-
-        self.reset_btn = Gtk.Button(label="Reset status")
-        self.reset_btn.set_tooltip_text(
-            "Clear staged operations AND the remembered 'done' state of the "
-            "selected images, so they can be processed fresh")
-        self.reset_btn.connect("clicked", self.on_reset_status)
-        header.pack_start(self.reset_btn)
-
+        # Purge history sits on the far (right) side
         self.purge_btn = Gtk.Button(label="Purge history")
         self.purge_btn.set_tooltip_text(
             "Delete the entire local processing log (with confirmation). "
             "Affects only the log, not your image files.")
         self.purge_btn.connect("clicked", self.on_purge_history)
-        header.pack_start(self.purge_btn)
+        header.pack_end(self.purge_btn)
 
         # ---------------- toolbar (grouped) ----------------
         def group(title, *widgets):
@@ -367,10 +356,11 @@ class WallprepApp(Gtk.Window):
             title="Choose output folder (use 'Create Folder' for a new one)",
             action=Gtk.FileChooserAction.SELECT_FOLDER)
         self.out_btn.set_filename(str(saved_out))
+        self.out_btn.set_size_request(420, -1)
         self.out_btn.set_tooltip_text(
             "Apply saves processed copies here. Remembered between sessions.")
         self.out_btn.connect("file-set", self.on_output_changed)
-        out_row.pack_start(self.out_btn, True, True, 0)
+        out_row.pack_start(self.out_btn, False, False, 0)
 
         open_out = Gtk.Button.new_from_icon_name(
             "folder-open-symbolic", Gtk.IconSize.BUTTON)
@@ -459,13 +449,8 @@ class WallprepApp(Gtk.Window):
         drawer_box.pack_start(self.report_toggle, False, False, 0)
         drawer_box.pack_start(self.report_reveal, False, False, 0)
         self._update_report_toggle_label()
-
-        self.drawer = Gtk.Revealer()
-        self.drawer.set_transition_type(
-            Gtk.RevealerTransitionType.SLIDE_LEFT)
-        self.drawer.set_reveal_child(True)
-        self.drawer.add(drawer_box)
-        self.drawer.set_size_request(THUMB_WIDTH + 40, -1)
+        self.drawer_box = drawer_box
+        drawer_box.set_size_request(THUMB_WIDTH + 40, -1)
 
         # collapse button sits just outside the drawer, so it stays visible
         # even when the drawer is hidden
@@ -478,12 +463,18 @@ class WallprepApp(Gtk.Window):
         self.drawer_btn.set_valign(Gtk.Align.START)
         self.drawer_btn.connect("toggled", self.on_drawer_toggle)
 
+        # a horizontal Paned makes the divider draggable -> drawer is
+        # manually resizable with the cursor
+        self.drawer_paned = Gtk.Paned(
+            orientation=Gtk.Orientation.HORIZONTAL)
+        self.drawer_paned.pack1(list_scroll, resize=True, shrink=False)
+        self.drawer_paned.pack2(drawer_box, resize=False, shrink=True)
+        # remember/restore the divider position
+        self._drawer_pos = int(self.cfg.get("drawer_pos", 0)) or None
+
         main_h = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        main_h.pack_start(list_scroll, True, True, 0)
-        main_h.pack_start(Gtk.Separator(
-            orientation=Gtk.Orientation.VERTICAL), False, False, 0)
+        main_h.pack_start(self.drawer_paned, True, True, 0)
         main_h.pack_start(self.drawer_btn, False, False, 0)
-        main_h.pack_start(self.drawer, False, False, 0)
 
         # ---------------- bottom bar: Export button ----------------
         self.apply_btn = Gtk.Button(label="Export private copies  →")
@@ -587,6 +578,11 @@ class WallprepApp(Gtk.Window):
         self.cfg["out_format"] = self.target_format()
         self.cfg["no_history"] = self.no_history_check.get_active()
         self.cfg["report_open"] = self.report_open
+        try:
+            if self.drawer_btn.get_active():
+                self.cfg["drawer_pos"] = self.drawer_paned.get_position()
+        except Exception:
+            pass
         save_json(CONFIG_FILE, self.cfg)
         if not self.no_history_check.get_active():
             save_json(PROCESSED_FILE, self.processed)
@@ -792,7 +788,14 @@ class WallprepApp(Gtk.Window):
         return False
 
     def on_drawer_toggle(self, btn):
-        self.drawer.set_reveal_child(btn.get_active())
+        if btn.get_active():
+            self.drawer_box.show()
+            if self._drawer_pos:
+                self.drawer_paned.set_position(self._drawer_pos)
+        else:
+            # remember where the divider was, then hide the panel
+            self._drawer_pos = self.drawer_paned.get_position()
+            self.drawer_box.hide()
 
     def _update_report_toggle_label(self):
         arrow = "▾" if self.report_open else "▸"
@@ -848,24 +851,6 @@ class WallprepApp(Gtk.Window):
             return
         self._sync_preset_combo()
         self._restage_resize()
-
-    def on_reset_status(self, _btn):
-        paths = self.selected_paths()
-        for p in paths:
-            st = self.info.get(p)
-            if not st:
-                continue
-            st.update(resize_to=None, new_name=None, strip=False, done=None)
-            try:
-                self.processed.pop(fingerprint(p), None)
-            except Exception:
-                pass
-            self._set_status(p, "")
-            GLib.idle_add(self._refresh_row, p)
-        save_json(PROCESSED_FILE, self.processed)
-        self.hint.set_label(
-            f"Status reset for {len(paths)} image(s) — staged operations "
-            "and 'done' memory cleared.")
 
     # ================= staging (preview only) =================
     def on_toggle_cleanrename(self, btn):
