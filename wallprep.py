@@ -215,6 +215,7 @@ class WallprepApp(Gtk.Window):
         self.processed = load_json(PROCESSED_FILE)
         # per-file state: path -> {w,h,meta,resize_to,new_name,strip,done}
         self.info = {}
+        self._status_plain = {}  # path -> un-marked status string
         self.busy = False
 
         provider = Gtk.CssProvider()
@@ -296,7 +297,7 @@ class WallprepApp(Gtk.Window):
         self.width_spin = Gtk.SpinButton.new_with_range(480, 7680, 10)
         self.width_spin.set_value(int(self.cfg.get("width", 1920)))
         self.width_spin.set_tooltip_text("Target size of the longest side")
-        px_label = Gtk.Label(label="px")
+        self.px_label = Gtk.Label(label="px")
 
         self._syncing = False
         self._sync_preset_combo()
@@ -304,7 +305,7 @@ class WallprepApp(Gtk.Window):
         self.width_spin.connect("value-changed", self.on_width_changed)
 
         ops_group = group("PREP", self.cleanrename_btn, self.resize_check,
-                          self.preset_combo, self.width_spin, px_label)
+                          self.preset_combo, self.width_spin, self.px_label)
 
         # --- Output group ---
         self.formats = [("Keep original", None), ("JPG", "jpg"),
@@ -377,7 +378,7 @@ class WallprepApp(Gtk.Window):
         for i, title in enumerate(("File", "Format", "Dimensions",
                                    "Metadata", "Status")):
             col = Gtk.TreeViewColumn(title, Gtk.CellRendererText(),
-                                     text=i + 1)
+                                     markup=i + 1)
             col.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
             col.set_resizable(True)
             self.tree.append_column(col)
@@ -477,7 +478,7 @@ class WallprepApp(Gtk.Window):
         main_h.pack_start(self.drawer_btn, False, False, 0)
 
         # ---------------- bottom bar: Export button ----------------
-        self.apply_btn = Gtk.Button(label="Export private copies  →")
+        self.apply_btn = Gtk.Button(label="Export  →")
         self.apply_btn.get_style_context().add_class("apply-btn")
         self.apply_btn.set_tooltip_text(
             "Apply all staged operations — one output file per image, "
@@ -644,8 +645,9 @@ class WallprepApp(Gtk.Window):
             self.info[p] = {"w": None, "h": None, "meta": {},
                             "resize_to": None, "new_name": None,
                             "strip": False, "done": None}
-            self.store.append([p, Path(p).name,
-                               Path(p).suffix.lower().lstrip("."),
+            self.store.append([p, GLib.markup_escape_text(Path(p).name),
+                               GLib.markup_escape_text(
+                                   Path(p).suffix.lower().lstrip(".")),
                                "…", "…", ""])
         if new:
             self.set_ops_sensitive(True)
@@ -659,6 +661,7 @@ class WallprepApp(Gtk.Window):
     def on_clear(self, _btn):
         self.store.clear()
         self.info.clear()
+        self._status_plain.clear()
         self.meta_store.clear()
         self.thumb.clear()
         self.drawer_title.set_label("Preview")
@@ -700,48 +703,65 @@ class WallprepApp(Gtk.Window):
         st = self.info.get(path)
         if not st:
             return False
-        name = Path(path).name
+        esc = GLib.markup_escape_text
+
+        # File: original name, with the future random name in bold after →
+        name = esc(Path(path).name)
         if st["new_name"]:
-            name += f"  →  {st['new_name']}"
+            name += f"  →  <b>{esc(st['new_name'])}</b>"
+
+        # Format: src ext, with the resulting ext in bold after → if changed
         src_ext = Path(path).suffix.lower().lstrip(".")
         out_ext = self._resulting_ext(path, st)
-        fmt = out_ext if out_ext == src_ext else f"{src_ext} → {out_ext}"
+        if out_ext == src_ext:
+            fmt = esc(out_ext)
+        else:
+            fmt = f"{esc(src_ext)} → <b>{esc(out_ext)}</b>"
+
+        # Dimensions: original, with the new size in bold after →
         if st["w"]:
             dims = f"{st['w']}×{st['h']}"
             if st["resize_to"]:
                 nw, nh = st["resize_to"]
                 if (nw, nh) != (st["w"], st["h"]):
-                    dims += f"  →  {nw}×{nh}"
+                    dims += f"  →  <b>{nw}×{nh}</b>"
                 else:
                     dims += "  (no change)"
         else:
             dims = "?"
+
+        # Metadata: current state, with the bold "clean" outcome after →
         n = len(st["meta"])
         has_ai = any(any(h_ in k.lower() for h_ in AI_HINTS)
                      for k in st["meta"])
         meta_lbl = ("clean ✓" if n == 0
                     else f"{n} tags" + (" ⚠ AI?" if has_ai else ""))
         if st["strip"] and n > 0:
-            meta_lbl += "  →  clean"
+            meta_lbl += "  →  <b>clean</b>"
+
         staged = [s for s, on in (("resize", st["resize_to"]),
                                   ("rename", st["new_name"]),
                                   ("clean", st["strip"])) if on]
         if staged:
             status = "staged: " + "+".join(staged)
         elif st["done"]:
-            status = f"✅ done → {display_path(st['done'])}"
+            status = f"✅ done → {esc(display_path(st['done']))}"
         else:
             status = ""
+        # plain marker to detect a finished/working status set elsewhere
+        cur_status_plain = self._status_plain.get(path, "")
         for row in self.store:
             if row[COL_PATH] == path:
                 row[COL_NAME] = name
                 row[COL_FMT] = fmt
                 row[COL_DIMS] = dims
                 row[COL_META] = meta_lbl
-                if not row[COL_STATUS].startswith(("✓", "⚠", "error")):
+                if not cur_status_plain.startswith(("✓", "⚠", "error")):
                     row[COL_STATUS] = status
+                    self._status_plain[path] = status
                 elif staged:
                     row[COL_STATUS] = status
+                    self._status_plain[path] = status
         self.tree.columns_autosize()
         return False
 
@@ -825,6 +845,13 @@ class WallprepApp(Gtk.Window):
         return self.formats[idx][1] if idx >= 0 else None
 
     # ================= presets / reset =================
+    def _update_width_visibility(self):
+        """Show the manual width spinner only when 'Custom' is chosen."""
+        idx = self.preset_combo.get_active()
+        is_custom = (idx >= 0 and self.presets[idx][1] is None)
+        self.width_spin.set_visible(is_custom)
+        self.px_label.set_visible(is_custom)
+
     def _sync_preset_combo(self):
         """Point the combo at the preset matching the spinner, or Custom."""
         self._syncing = True
@@ -833,6 +860,7 @@ class WallprepApp(Gtk.Window):
                     if v == val), len(self.presets) - 1)
         self.preset_combo.set_active(idx)
         self._syncing = False
+        self._update_width_visibility()
 
     def on_preset_changed(self, combo):
         if self._syncing:
@@ -845,6 +873,8 @@ class WallprepApp(Gtk.Window):
             self._syncing = True
             self.width_spin.set_value(value)
             self._syncing = False
+            self._restage_resize()
+        self._update_width_visibility()
 
     def on_width_changed(self, _spin):
         if self._syncing:
@@ -1094,7 +1124,7 @@ class WallprepApp(Gtk.Window):
                             "-define", "png:compression-level=9"]
                 else:  # jpg
                     cmd += ["-sampling-factor", "4:2:0",
-                            "-quality", "92", "-interlace", "none"]
+                            "-quality", "95", "-interlace", "none"]
             cmd += [str(dest)]
             subprocess.run(cmd, check=True, capture_output=True, timeout=120)
         else:
@@ -1144,9 +1174,11 @@ class WallprepApp(Gtk.Window):
         return True, ""
 
     def _set_status(self, path, status):
+        self._status_plain[path] = status
+        markup = GLib.markup_escape_text(status)
         for row in self.store:
             if row[COL_PATH] == path:
-                row[COL_STATUS] = status
+                row[COL_STATUS] = markup
         return False
 
     def _done(self, ok, total, out):
@@ -1200,4 +1232,5 @@ if __name__ == "__main__":
         raise SystemExit(1)
     win = WallprepApp()
     win.show_all()
+    win._update_width_visibility()  # after show_all, which would reveal it
     Gtk.main()
