@@ -255,6 +255,31 @@ class WallprepApp(Gtk.Window):
         self.all_btn.connect("clicked", self.on_stage_all)
         bar.pack_start(self.all_btn, False, False, 0)
 
+        self.neutralize_check = Gtk.CheckButton(label="Neutralize")
+        self.neutralize_check.set_tooltip_text(
+            "Maximum anonymity: re-encode every output with standardized, "
+            "metadata-free settings and normalized timestamps, so all "
+            "outputs look like generic, identical exports. Implies Clean.")
+        self.neutralize_check.set_active(bool(self.cfg.get("neutralize",
+                                                           False)))
+        bar.pack_start(self.neutralize_check, False, False, 0)
+
+        bar.pack_start(Gtk.Label(label="Format:"), False, False, 0)
+        self.formats = [("Keep original", None), ("JPG", "jpg"),
+                        ("PNG", "png")]
+        self.format_combo = Gtk.ComboBoxText()
+        for label, _v in self.formats:
+            self.format_combo.append_text(label)
+        saved_fmt = self.cfg.get("out_format")  # None / "jpg" / "png"
+        self.format_combo.set_active(
+            next((i for i, (_l, v) in enumerate(self.formats)
+                  if v == saved_fmt), 0))
+        self.format_combo.set_tooltip_text(
+            "Output format. 'Keep original' preserves each image's format "
+            "(except portraits already handled by resize). JPG = small, "
+            "PNG = lossless.")
+        bar.pack_start(self.format_combo, False, False, 0)
+
         self.reset_btn = Gtk.Button(label="Reset status")
         self.reset_btn.set_tooltip_text(
             "Clear staged operations AND the remembered 'done' state of "
@@ -398,6 +423,8 @@ class WallprepApp(Gtk.Window):
     def on_destroy(self, _win):
         self.cfg["output_dir"] = self.out_btn.get_filename()
         self.cfg["width"] = int(self.width_spin.get_value())
+        self.cfg["neutralize"] = self.neutralize_check.get_active()
+        self.cfg["out_format"] = self.target_format()
         save_json(CONFIG_FILE, self.cfg)
         save_json(PROCESSED_FILE, self.processed)
         Gtk.main_quit()
@@ -589,6 +616,11 @@ class WallprepApp(Gtk.Window):
         out.mkdir(parents=True, exist_ok=True)
         return out
 
+    def target_format(self):
+        """Chosen output extension ('jpg'/'png') or None to keep original."""
+        idx = self.format_combo.get_active()
+        return self.formats[idx][1] if idx >= 0 else None
+
     # ================= presets / reset =================
     def _sync_preset_combo(self):
         """Point the combo at the preset matching the spinner, or Custom."""
@@ -711,13 +743,22 @@ class WallprepApp(Gtk.Window):
     def on_apply(self, _btn):
         if self.busy:
             return
-        jobs = [(p, dict(self.info[p])) for p in self.selected_paths()
-                if self.info[p]["resize_to"] or self.info[p]["new_name"]
-                or self.info[p]["strip"]]
+        neutralize = self.neutralize_check.get_active()
+        out_format = self.target_format()
+        jobs = []
+        for p in self.selected_paths():
+            st = self.info[p]
+            has_staged = (st["resize_to"] or st["new_name"] or st["strip"])
+            if has_staged or neutralize or out_format:
+                job = dict(st)
+                job["neutralize"] = neutralize
+                job["out_format"] = out_format
+                jobs.append((p, job))
         if not jobs:
             self.hint.set_label(
                 "Nothing staged — click Resize / Rename / Clean first "
-                "to preview, then Apply.")
+                "to preview, then Apply. (Or tick Neutralize / pick a "
+                "Format.)")
             return
         out = self.output_dir()
         self.busy = True
@@ -758,68 +799,85 @@ class WallprepApp(Gtk.Window):
         GLib.idle_add(self._done, ok, len(jobs), out)
 
     def _apply_one(self, src: Path, st: dict, out: Path) -> Path:
-        # decide the output name (ONE file per image)
-        if st["new_name"]:
-            dest = out / st["new_name"]
-            while dest.exists():
-                ext = Path(st["new_name"]).suffix
-                dest = out / (random_name() + ext)
+        neutralize = st.get("neutralize", False)
+        out_format = st.get("out_format")  # None / "jpg" / "png"
+        strip = st["strip"] or neutralize
+        # resolve target extension
+        if out_format:
+            ext = "." + out_format
+        elif st["new_name"]:
+            ext = Path(st["new_name"]).suffix
         else:
-            dest = out / src.name
-            i = 1
-            while dest.exists():
-                dest = out / f"{src.stem}-{i}{src.suffix}"
-                i += 1
-        # resize (writes dest) or plain copy
-        if st["resize_to"] and (st["resize_to"][0] != st["w"]
-                                or st["resize_to"][1] != st["h"]):
-            geometry = f"{st['resize_to'][0]}x{st['resize_to'][1]}!"
-            strip_flag = ["-strip"] if st["strip"] else []
-            subprocess.run(["convert", str(src), "-resize", geometry,
-                            *strip_flag, str(dest)],
-                           check=True, capture_output=True, timeout=120)
+            ext = src.suffix
+        ext = ext.lower().replace(".jpeg", ".jpg")
+        # resolve output stem
+        stem = Path(st["new_name"]).stem if st["new_name"] else src.stem
+        dest = out / (stem + ext)
+        i = 1
+        while dest.exists():
+            dest = out / (random_name() + ext if st["new_name"]
+                          else f"{stem}-{i}{ext}")
+            i += 1
+
+        resized = st["resize_to"] and (st["resize_to"][0] != st["w"]
+                                       or st["resize_to"][1] != st["h"])
+        # a format change forces a re-encode even if nothing else changed
+        changing_format = ext != src.suffix.lower().replace(".jpeg", ".jpg")
+
+        if neutralize or strip or resized or changing_format:
+            cmd = ["convert", str(src)]
+            if resized:
+                cmd += ["-resize",
+                        f"{st['resize_to'][0]}x{st['resize_to'][1]}!"]
+            if strip:
+                cmd += ["-strip"]
+            if neutralize:
+                # standardized, generic encoder settings so outputs are
+                # uniform regardless of the source tool
+                if ext == ".png":
+                    cmd += ["-define", "png:include-chunk=none",
+                            "-define", "png:compression-level=9"]
+                else:  # jpg
+                    cmd += ["-sampling-factor", "4:2:0",
+                            "-quality", "90", "-interlace", "none"]
+            cmd += [str(dest)]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=120)
         else:
             shutil.copy2(src, dest)
-        # clean metadata (deep clean: all tags + ICC profile)
-        if st["strip"]:
-            # -all= removes every metadata tag; ICC profiles are a separate
-            # group exiftool also drops with -all=, but we pass it through
-            # convert too so the pixel encoder fingerprint is rewritten even
-            # on a Clean-only run (no resize).
-            if not (st["resize_to"] and (st["resize_to"][0] != st["w"]
-                                         or st["resize_to"][1] != st["h"])):
-                # no resize happened, so dest is still a byte copy of src —
-                # re-encode it in place to scrub encoder traces
-                subprocess.run(["convert", str(dest), "-strip", str(dest)],
-                               check=True, capture_output=True, timeout=120)
+
+        if strip:
             subprocess.run(["exiftool", "-all=", "-overwrite_original",
                             "-quiet", str(dest)],
                            check=True, capture_output=True, timeout=60)
-            # normalize timestamps so the original creation time doesn't leak
             now = time.time()
             os.utime(dest, (now, now))
         return dest
 
     def _verify(self, dest: Path, st: dict):
         """Independently re-check the output file against what was staged."""
+        neutralize = st.get("neutralize", False)
+        out_format = st.get("out_format")
+        strip = st["strip"] or neutralize
         if not dest.exists():
             return False, "output file missing"
+        if out_format and dest.suffix.lower().replace(".jpeg", ".jpg") \
+                != "." + out_format:
+            return False, f"output is not {out_format.upper()}"
         if st["resize_to"]:
             w, h = image_dimensions(str(dest))
             if (w, h) != tuple(st["resize_to"]):
                 return False, f"size is {w}×{h}, expected " \
                               f"{st['resize_to'][0]}×{st['resize_to'][1]}"
-        if st["strip"]:
+        if strip:
             leftover = read_metadata(str(dest))
             if leftover:
                 return False, f"{len(leftover)} metadata tag(s) remain"
-            # confirm the ICC profile was removed too
             icc = subprocess.run(
                 ["exiftool", "-ICC_Profile:all", str(dest)],
                 capture_output=True, text=True, timeout=30)
             if icc.stdout.strip():
                 return False, "ICC color profile remains"
-        if st["new_name"] and dest.suffix.lower() not in SUPPORTED:
+        if dest.suffix.lower() not in SUPPORTED:
             return False, "unexpected file extension"
         return True, ""
 
