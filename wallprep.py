@@ -68,7 +68,7 @@ AI_HINTS = ("software", "artist", "creator", "generator", "prompt", "stable",
             "diffusion", "midjourney", "dall", "comfyui", "parameters",
             "usercomment", "description", "model")
 
-COL_PATH, COL_NAME, COL_DIMS, COL_META, COL_STATUS = range(5)
+COL_PATH, COL_NAME, COL_FMT, COL_DIMS, COL_META, COL_STATUS = range(6)
 
 CSS = b"""
 treeview.file-list { font-size: 10.5px; }
@@ -278,8 +278,9 @@ class WallprepApp(Gtk.Window):
         self.safe_btn = Gtk.Button(label="Paranoid")
         self.safe_btn.set_tooltip_text(
             "Paranoid: maximum privacy in one click — Clean + Rename + "
-            "Resize, forces JPG output, and turns on No-history (deleting "
-            "any existing local log). Leaves no source-to-output trail.")
+            "Resize, forces JPG output, and turns on No-history so future "
+            "processing isn't logged. (To erase an existing log too, use "
+            "Purge history.)")
         self.safe_btn.connect("clicked", self.on_stage_safe)
         bar.pack_start(self.safe_btn, False, False, 0)
 
@@ -297,31 +298,18 @@ class WallprepApp(Gtk.Window):
         self.format_combo.set_tooltip_text(
             "Output format. 'Keep original' preserves each image's format. "
             "JPG = small (default), PNG = lossless.")
+        self.format_combo.connect("changed", self.on_format_changed)
         bar.pack_start(self.format_combo, False, False, 0)
 
         self.no_history_check = Gtk.CheckButton(label="No history")
         self.no_history_check.set_tooltip_text(
-            "Don't record processed images to the local history file. "
-            "Normally wallprep remembers what it processed (to show "
-            "'done ✓') — but that log links your originals to their "
-            "outputs. With this on, nothing is written to disk about "
-            "what you processed.")
+            "Forward-looking: when on, images you process from now on are "
+            "NOT recorded to the local log. (The log normally lets the app "
+            "show 'done ✓'.) To erase an existing log, use Purge history.")
         self.no_history_check.set_active(bool(self.cfg.get("no_history",
                                                            False)))
         self.no_history_check.connect("toggled", self.on_no_history_toggled)
         bar.pack_start(self.no_history_check, False, False, 0)
-
-        self.reset_btn = Gtk.Button(label="Reset status")
-        self.reset_btn.set_tooltip_text(
-            "Clear staged operations AND the remembered 'done' state of "
-            "the selected images, so they can be processed fresh")
-        self.reset_btn.connect("clicked", self.on_reset_status)
-        bar.pack_end(self.reset_btn, False, False, 0)
-
-        sel_all = Gtk.Button(label="Select all")
-        sel_all.connect("clicked",
-                        lambda *_: self.tree.get_selection().select_all())
-        bar.pack_end(sel_all, False, False, 0)
 
         # ---------------- output folder row ----------------
         out_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -350,12 +338,12 @@ class WallprepApp(Gtk.Window):
         out_row.pack_start(open_out, False, False, 0)
 
         # ---------------- file list ----------------
-        self.store = Gtk.ListStore(str, str, str, str, str)
+        self.store = Gtk.ListStore(str, str, str, str, str, str)
         self.tree = Gtk.TreeView(model=self.store)
         self.tree.get_style_context().add_class("file-list")
         self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self.tree.get_selection().connect("changed", self.on_selection_changed)
-        for i, title in enumerate(("File", "Dimensions",
+        for i, title in enumerate(("File", "Format", "Dimensions",
                                    "Metadata", "Status")):
             col = Gtk.TreeViewColumn(title, Gtk.CellRendererText(),
                                      text=i + 1)
@@ -423,10 +411,32 @@ class WallprepApp(Gtk.Window):
             "then verify the result")
         self.apply_btn.connect("clicked", self.on_apply)
 
-        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        sel_all = Gtk.Button(label="Select all")
+        sel_all.set_tooltip_text("Select every image in the list")
+        sel_all.connect("clicked",
+                        lambda *_: self.tree.get_selection().select_all())
+
+        self.reset_btn = Gtk.Button(label="Reset status")
+        self.reset_btn.set_tooltip_text(
+            "Clear staged operations AND the remembered 'done' state of the "
+            "selected images, so they can be processed fresh")
+        self.reset_btn.connect("clicked", self.on_reset_status)
+
+        self.purge_btn = Gtk.Button(label="Purge history")
+        self.purge_btn.set_tooltip_text(
+            "Delete the entire local processing log (with confirmation). "
+            "Affects only the log, not your image files.")
+        self.purge_btn.connect("clicked", self.on_purge_history)
+
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         bottom.set_margin_top(8)
         bottom.set_margin_bottom(4)
-        bottom.set_center_widget(self.apply_btn)
+        bottom.set_margin_start(10)
+        bottom.set_margin_end(10)
+        bottom.pack_start(sel_all, False, False, 0)
+        bottom.pack_start(self.reset_btn, False, False, 0)
+        bottom.pack_start(self.purge_btn, False, False, 0)
+        bottom.pack_end(self.apply_btn, False, False, 0)
 
         self.hint = Gtk.Label(
             label="Add images, select them, stage operations "
@@ -451,26 +461,54 @@ class WallprepApp(Gtk.Window):
         self.cfg["output_dir"] = self.out_btn.get_filename()
         save_json(CONFIG_FILE, self.cfg)
 
+    def on_format_changed(self, _combo):
+        # the resulting-format column depends on this, so refresh every row
+        for row in self.store:
+            self._refresh_row(row[COL_PATH])
+
     def on_no_history_toggled(self, btn):
+        # forward-looking only: controls whether FUTURE processing is logged.
+        # (To erase the EXISTING log, use the "Purge history" button.)
         if btn.get_active():
-            # purge any existing trail the moment privacy mode is enabled
-            self.processed = {}
-            try:
-                PROCESSED_FILE.unlink(missing_ok=True)
-            except Exception:
-                pass
-            # also drop the stored source-folder clue
-            self.cfg.pop("last_folder", None)
+            self.cfg.pop("last_folder", None)  # stop leaking source folder
             save_json(CONFIG_FILE, self.cfg)
-            # refresh rows so any "done ✓" markers from the old log disappear
-            for row in self.store:
-                p = row[COL_PATH]
-                if p in self.info and self.info[p].get("done"):
-                    self.info[p]["done"] = None
-                    self._refresh_row(p)
             self.hint.set_label(
-                "No-history on — existing processing log deleted. Nothing "
-                "about what you process will be written to disk.")
+                "No-history on — images you process from now on won't be "
+                "logged. (Existing log is untouched; use Purge history to "
+                "erase it.)")
+        else:
+            self.hint.set_label(
+                "No-history off — processed images will be remembered "
+                "(shown as done ✓).")
+
+    def on_purge_history(self, _btn):
+        n = len(self.processed)
+        dialog = Gtk.MessageDialog(
+            transient_for=self, modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Purge processing history?")
+        dialog.format_secondary_text(
+            f"This permanently deletes the local log of {n} processed "
+            f"image(s) ({display_path(PROCESSED_FILE)}). Your actual image "
+            "files are not affected. This cannot be undone.")
+        resp = dialog.run()
+        dialog.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return
+        self.processed = {}
+        try:
+            PROCESSED_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        # clear any "done ✓" markers now that the log is gone
+        for row in self.store:
+            p = row[COL_PATH]
+            if p in self.info and self.info[p].get("done"):
+                self.info[p]["done"] = None
+                self._refresh_row(p)
+        self.hint.set_label(f"Purged {n} history entry(ies). The local log "
+                            "is gone; image files are untouched.")
 
     def on_destroy(self, _win):
         self.cfg["output_dir"] = self.out_btn.get_filename()
@@ -538,7 +576,9 @@ class WallprepApp(Gtk.Window):
             self.info[p] = {"w": None, "h": None, "meta": {},
                             "resize_to": None, "new_name": None,
                             "strip": False, "done": None}
-            self.store.append([p, Path(p).name, "…", "…", ""])
+            self.store.append([p, Path(p).name,
+                               Path(p).suffix.lower().lstrip("."),
+                               "…", "…", ""])
         if new:
             self.set_ops_sensitive(True)
             self.hint.set_label(
@@ -571,6 +611,21 @@ class WallprepApp(Gtk.Window):
             GLib.idle_add(self._refresh_row, p)
 
     # ================= row display =================
+    def _resulting_ext(self, path, st):
+        """The extension the output will have, given the Format choice and
+        the WebP→JPG-on-clean rule. Mirrors _apply_one."""
+        out_format = self.target_format()
+        if out_format:
+            ext = out_format
+        elif st["new_name"]:
+            ext = Path(st["new_name"]).suffix.lstrip(".")
+        else:
+            ext = Path(path).suffix.lstrip(".")
+        ext = ext.lower().replace("jpeg", "jpg")
+        if st["strip"] and ext == "webp":
+            ext = "jpg"
+        return ext
+
     def _refresh_row(self, path):
         st = self.info.get(path)
         if not st:
@@ -578,6 +633,9 @@ class WallprepApp(Gtk.Window):
         name = Path(path).name
         if st["new_name"]:
             name += f"  →  {st['new_name']}"
+        src_ext = Path(path).suffix.lower().lstrip(".")
+        out_ext = self._resulting_ext(path, st)
+        fmt = out_ext if out_ext == src_ext else f"{src_ext} → {out_ext}"
         if st["w"]:
             dims = f"{st['w']}×{st['h']}"
             if st["resize_to"]:
@@ -607,6 +665,7 @@ class WallprepApp(Gtk.Window):
         for row in self.store:
             if row[COL_PATH] == path:
                 row[COL_NAME] = name
+                row[COL_FMT] = fmt
                 row[COL_DIMS] = dims
                 row[COL_META] = meta_lbl
                 if not row[COL_STATUS].startswith(("✓", "⚠", "error")):
@@ -796,13 +855,14 @@ class WallprepApp(Gtk.Window):
                         if v == "jpg"), None)
         if jpg_idx is not None:
             self.format_combo.set_active(jpg_idx)
-        # enable no-history (its handler also purges any existing log)
+        # enable no-history going forward (does not auto-delete the existing
+        # log — that's the deliberate, confirmed Purge history button)
         self.no_history_check.set_active(True)
         self.hint.set_label(
             "Paranoid staged: Clean + Rename + Resize, output forced to "
-            "JPG, history off (existing log purged). Press Apply. (Removes "
-            "metadata/profile/timestamp and randomizes names — does NOT "
-            "remove AI watermarks or provider-side records.)")
+            "JPG, future logging off. Press Apply. (To also erase past "
+            "history, click Purge history. This does NOT remove AI "
+            "watermarks or provider-side records.)")
 
     def _staging_hint(self):
         n = sum(1 for st in self.info.values()
