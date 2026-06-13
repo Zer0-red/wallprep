@@ -214,12 +214,27 @@ class WallprepApp(Gtk.Window):
         self.drawer_btn.connect("toggled", self.on_drawer_toggle)
         header.pack_end(self.drawer_btn)
 
-        # ---------------- toolbar ----------------
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        # ---------------- toolbar (grouped) ----------------
+        def group(title, *widgets):
+            """A labelled vertical group: small caption + a row of widgets."""
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            cap = Gtk.Label(xalign=0.0)
+            cap.set_markup(
+                f"<span size='x-small' weight='bold'>{title}</span>")
+            cap.get_style_context().add_class("dim-label")
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            for w in widgets:
+                row.pack_start(w, False, False, 0)
+            col.pack_start(cap, False, False, 0)
+            col.pack_start(row, False, False, 0)
+            return col
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         for m in ("set_margin_top", "set_margin_bottom",
                   "set_margin_start", "set_margin_end"):
             getattr(bar, m)(10)
 
+        # --- Operations group ---
         self.clean_btn = Gtk.Button(label="Clean")
         self.clean_btn.set_tooltip_text(
             "Stage a full anonymizing clean (preview only): remove ALL "
@@ -228,20 +243,17 @@ class WallprepApp(Gtk.Window):
             "like a plain, identical export with no trace of the source "
             "tool")
         self.clean_btn.connect("clicked", self.on_stage_clean)
-        bar.pack_start(self.clean_btn, False, False, 0)
 
         self.rename_btn = Gtk.Button(label="Rename")
         self.rename_btn.set_tooltip_text(
             f"Stage a random {NAME_LENGTH}-character name (preview only)")
         self.rename_btn.connect("clicked", self.on_stage_rename)
-        bar.pack_start(self.rename_btn, False, False, 0)
 
         self.resize_btn = Gtk.Button(label="Resize")
         self.resize_btn.set_tooltip_text(
             "Stage a resize: the LONGEST side becomes this size "
             "(landscape -> width, portrait -> height). Preview only.")
         self.resize_btn.connect("clicked", self.on_stage_resize)
-        bar.pack_start(self.resize_btn, False, False, 0)
 
         # resolution presets (value = longest side)
         self.presets = [("720p (HD)", 1280), ("1080p (FHD)", 1920),
@@ -251,29 +263,27 @@ class WallprepApp(Gtk.Window):
         for label, _v in self.presets:
             self.preset_combo.append_text(label)
         self.preset_combo.set_tooltip_text("Common resolutions")
-        bar.pack_start(self.preset_combo, False, False, 0)
 
         self.width_spin = Gtk.SpinButton.new_with_range(480, 7680, 10)
         self.width_spin.set_value(int(self.cfg.get("width", 1920)))
         self.width_spin.set_tooltip_text("Target size of the longest side")
-        bar.pack_start(self.width_spin, False, False, 0)
-        bar.pack_start(Gtk.Label(label="px"), False, False, 0)
+        px_label = Gtk.Label(label="px")
 
-        # keep combo and spinner in sync (guard against signal loops)
         self._syncing = False
         self._sync_preset_combo()
         self.preset_combo.connect("changed", self.on_preset_changed)
         self.width_spin.connect("value-changed", self.on_width_changed)
 
-        bar.pack_start(Gtk.Separator(
-            orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+        ops_group = group("OPERATIONS", self.clean_btn, self.rename_btn,
+                          self.resize_btn, self.preset_combo,
+                          self.width_spin, px_label)
 
+        # --- Presets group ---
         self.all_btn = Gtk.Button(label="Full clean")
         self.all_btn.set_tooltip_text(
             "Full clean: stage Clean + Rename + Resize together (preview "
             "only). Respects your current Format and No-history choices.")
         self.all_btn.connect("clicked", self.on_stage_all)
-        bar.pack_start(self.all_btn, False, False, 0)
 
         self.safe_btn = Gtk.Button(label="Paranoid")
         self.safe_btn.set_tooltip_text(
@@ -282,15 +292,15 @@ class WallprepApp(Gtk.Window):
             "processing isn't logged. (To erase an existing log too, use "
             "Purge history.)")
         self.safe_btn.connect("clicked", self.on_stage_safe)
-        bar.pack_start(self.safe_btn, False, False, 0)
 
-        bar.pack_start(Gtk.Label(label="Format:"), False, False, 0)
+        presets_group = group("PRESETS", self.all_btn, self.safe_btn)
+
+        # --- Output group ---
         self.formats = [("Keep original", None), ("JPG", "jpg"),
                         ("PNG", "png")]
         self.format_combo = Gtk.ComboBoxText()
         for label, _v in self.formats:
             self.format_combo.append_text(label)
-        # default to JPG unless the user previously chose otherwise
         saved_fmt = self.cfg.get("out_format", "jpg")  # None / "jpg" / "png"
         self.format_combo.set_active(
             next((i for i, (_l, v) in enumerate(self.formats)
@@ -299,7 +309,6 @@ class WallprepApp(Gtk.Window):
             "Output format. 'Keep original' preserves each image's format. "
             "JPG = small (default), PNG = lossless.")
         self.format_combo.connect("changed", self.on_format_changed)
-        bar.pack_start(self.format_combo, False, False, 0)
 
         self.no_history_check = Gtk.CheckButton(label="No history")
         self.no_history_check.set_tooltip_text(
@@ -309,7 +318,19 @@ class WallprepApp(Gtk.Window):
         self.no_history_check.set_active(bool(self.cfg.get("no_history",
                                                            False)))
         self.no_history_check.connect("toggled", self.on_no_history_toggled)
-        bar.pack_start(self.no_history_check, False, False, 0)
+
+        output_group = group("OUTPUT", self.format_combo,
+                             self.no_history_check)
+
+        # assemble groups with dividers
+        def divider():
+            return Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+
+        bar.pack_start(ops_group, False, False, 0)
+        bar.pack_start(divider(), False, False, 0)
+        bar.pack_start(presets_group, False, False, 0)
+        bar.pack_start(divider(), False, False, 0)
+        bar.pack_start(output_group, False, False, 0)
 
         # ---------------- output folder row ----------------
         out_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -436,6 +457,9 @@ class WallprepApp(Gtk.Window):
         bottom.pack_start(sel_all, False, False, 0)
         bottom.pack_start(self.reset_btn, False, False, 0)
         bottom.pack_start(self.purge_btn, False, False, 0)
+        self.counter = Gtk.Label(xalign=0.0)
+        self.counter.get_style_context().add_class("dim-label")
+        bottom.pack_start(self.counter, True, True, 8)
         bottom.pack_end(self.apply_btn, False, False, 0)
 
         self.hint = Gtk.Label(
@@ -581,6 +605,7 @@ class WallprepApp(Gtk.Window):
                                "…", "…", ""])
         if new:
             self.set_ops_sensitive(True)
+            self._update_counter()
             self.hint.set_label(
                 f"{len(self.store)} image(s) loaded. Stage operations, "
                 "then press Apply.")
@@ -594,6 +619,7 @@ class WallprepApp(Gtk.Window):
         self.thumb.clear()
         self.drawer_title.set_label("Preview")
         self.set_ops_sensitive(False)
+        self._update_counter()
         self.hint.set_label("List cleared. Add a folder or images to start.")
 
     def _scan(self, paths):
@@ -864,9 +890,19 @@ class WallprepApp(Gtk.Window):
             "history, click Purge history. This does NOT remove AI "
             "watermarks or provider-side records.)")
 
+    def _update_counter(self):
+        total = len(self.store)
+        staged = sum(1 for st in self.info.values()
+                     if st["resize_to"] or st["new_name"] or st["strip"])
+        if total == 0:
+            self.counter.set_text("")
+        else:
+            self.counter.set_text(f"{total} image(s) · {staged} staged")
+
     def _staging_hint(self):
         n = sum(1 for st in self.info.values()
                 if st["resize_to"] or st["new_name"] or st["strip"])
+        self._update_counter()
         self.hint.set_label(
             f"{n} image(s) have staged operations — press Apply. "
             "Nothing is written until then." if n else
