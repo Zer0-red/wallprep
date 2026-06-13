@@ -268,17 +268,18 @@ class WallprepApp(Gtk.Window):
         bar.pack_start(Gtk.Separator(
             orientation=Gtk.Orientation.VERTICAL), False, False, 4)
 
-        self.all_btn = Gtk.Button(label="All 3")
+        self.all_btn = Gtk.Button(label="Full clean")
         self.all_btn.set_tooltip_text(
-            "Stage Clean + Rename + Resize together (preview only)")
+            "Full clean: stage Clean + Rename + Resize together (preview "
+            "only). Respects your current Format and No-history choices.")
         self.all_btn.connect("clicked", self.on_stage_all)
         bar.pack_start(self.all_btn, False, False, 0)
 
-        self.safe_btn = Gtk.Button(label="Safe")
+        self.safe_btn = Gtk.Button(label="Paranoid")
         self.safe_btn.set_tooltip_text(
-            "Maximum privacy in one click: Clean + Rename + Resize, and "
-            "forces output to flattened JPG. Not the default — your Format "
-            "choice is left untouched for normal use.")
+            "Paranoid: maximum privacy in one click — Clean + Rename + "
+            "Resize, forces JPG output, and turns on No-history (deleting "
+            "any existing local log). Leaves no source-to-output trail.")
         self.safe_btn.connect("clicked", self.on_stage_safe)
         bar.pack_start(self.safe_btn, False, False, 0)
 
@@ -307,6 +308,7 @@ class WallprepApp(Gtk.Window):
             "what you processed.")
         self.no_history_check.set_active(bool(self.cfg.get("no_history",
                                                            False)))
+        self.no_history_check.connect("toggled", self.on_no_history_toggled)
         bar.pack_start(self.no_history_check, False, False, 0)
 
         self.reset_btn = Gtk.Button(label="Reset status")
@@ -449,13 +451,35 @@ class WallprepApp(Gtk.Window):
         self.cfg["output_dir"] = self.out_btn.get_filename()
         save_json(CONFIG_FILE, self.cfg)
 
+    def on_no_history_toggled(self, btn):
+        if btn.get_active():
+            # purge any existing trail the moment privacy mode is enabled
+            self.processed = {}
+            try:
+                PROCESSED_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+            # also drop the stored source-folder clue
+            self.cfg.pop("last_folder", None)
+            save_json(CONFIG_FILE, self.cfg)
+            # refresh rows so any "done ✓" markers from the old log disappear
+            for row in self.store:
+                p = row[COL_PATH]
+                if p in self.info and self.info[p].get("done"):
+                    self.info[p]["done"] = None
+                    self._refresh_row(p)
+            self.hint.set_label(
+                "No-history on — existing processing log deleted. Nothing "
+                "about what you process will be written to disk.")
+
     def on_destroy(self, _win):
         self.cfg["output_dir"] = self.out_btn.get_filename()
         self.cfg["width"] = int(self.width_spin.get_value())
         self.cfg["out_format"] = self.target_format()
         self.cfg["no_history"] = self.no_history_check.get_active()
         save_json(CONFIG_FILE, self.cfg)
-        save_json(PROCESSED_FILE, self.processed)
+        if not self.no_history_check.get_active():
+            save_json(PROCESSED_FILE, self.processed)
         Gtk.main_quit()
 
     # ================= adding files =================
@@ -470,8 +494,10 @@ class WallprepApp(Gtk.Window):
             dialog.set_current_folder(last)
         if dialog.run() == Gtk.ResponseType.OK:
             folder = Path(dialog.get_filename())
-            self.cfg["last_folder"] = str(folder)
-            save_json(CONFIG_FILE, self.cfg)
+            # don't store a source-folder clue when privacy mode is on
+            if not self.no_history_check.get_active():
+                self.cfg["last_folder"] = str(folder)
+                save_json(CONFIG_FILE, self.cfg)
             self.add_paths(sorted(p for p in folder.iterdir()
                                   if p.is_file()
                                   and p.suffix.lower() in SUPPORTED))
@@ -761,20 +787,22 @@ class WallprepApp(Gtk.Window):
         self._staging_hint()
 
     def on_stage_safe(self, _btn):
-        """One-click maximum privacy: stage Clean + Rename + Resize AND
-        force the output format to JPG (flattened). Sets the Format dropdown
-        to JPG so the choice is visible, not hidden."""
+        """Paranoid: one-click maximum privacy — stage Clean + Rename +
+        Resize, force the output format to JPG (flattened), AND enable
+        No-history so no local source-to-output trail is left behind."""
         self.on_stage_all(_btn)
         # force JPG output so the result is flattened & uniformly re-encoded
         jpg_idx = next((i for i, (_l, v) in enumerate(self.formats)
                         if v == "jpg"), None)
         if jpg_idx is not None:
             self.format_combo.set_active(jpg_idx)
+        # enable no-history (its handler also purges any existing log)
+        self.no_history_check.set_active(True)
         self.hint.set_label(
-            "Safe mode staged: Clean + Rename + Resize, output forced to "
-            "JPG. Press Apply. (This removes metadata/profile/timestamp and "
-            "randomizes names — it does NOT remove AI watermarks or "
-            "provider-side records.)")
+            "Paranoid staged: Clean + Rename + Resize, output forced to "
+            "JPG, history off (existing log purged). Press Apply. (Removes "
+            "metadata/profile/timestamp and randomizes names — does NOT "
+            "remove AI watermarks or provider-side records.)")
 
     def _staging_hint(self):
         n = sum(1 for st in self.info.values()
