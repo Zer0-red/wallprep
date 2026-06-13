@@ -85,7 +85,56 @@ button.apply-btn {
 button.apply-btn:hover { background-color: #8b5cf6; }
 button.apply-btn:active { background-color: #6d28d9; }
 button.apply-btn:disabled { background-color: #b9a7e8; color: #f3f0fa; }
+
+button.profile-card {
+    background-image: none;
+    padding: 8px 14px;
+    border-radius: 10px;
+}
+button.profile-card.selected {
+    background-color: alpha(#7c3aed, 0.18);
+    border-color: #7c3aed;
+    color: #c4b5fd;
+}
+.pill {
+    background-color: alpha(#7c3aed, 0.22);
+    color: #c4b5fd;
+    border-radius: 8px;
+    padding: 1px 8px;
+    font-size: 9px;
+    font-weight: bold;
+}
+.pill-off {
+    background-color: alpha(#888888, 0.18);
+    color: #999999;
+    border-radius: 8px;
+    padding: 1px 8px;
+    font-size: 9px;
+    font-weight: bold;
+}
+.report-ok { color: #34d399; font-size: 11px; }
+.report-pending { color: #888888; font-size: 11px; }
+.report-banner {
+    background-color: alpha(#f59e0b, 0.12);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
 """
+
+# Privacy profiles: each maps to a bundle of the underlying operations.
+# (Operations themselves stay available individually — profiles just set them.)
+PROFILES = {
+    "basic":    {"label": "Basic clean",   "desc": "Remove common metadata",
+                 "strip": True,  "rename": False, "resize": False,
+                 "format": None, "no_history": False},
+    "safe":     {"label": "Safe export",   "desc": "Good balance for sharing",
+                 "strip": True,  "rename": True,  "resize": True,
+                 "format": "jpg", "no_history": False},
+    "paranoid": {"label": "Paranoid",      "desc": "Maximum privacy",
+                 "strip": True,  "rename": True,  "resize": True,
+                 "format": "jpg", "no_history": True},
+}
+
 
 
 # ---------------- persistence helpers ----------------
@@ -404,12 +453,29 @@ class WallprepApp(Gtk.Window):
         meta_scroll.set_vexpand(True)
         meta_scroll.add(meta_tree)
 
+        # privacy report: live checklist of what export will do
+        report_title = Gtk.Label(xalign=0.0)
+        report_title.set_markup("<span weight='bold'>Privacy report</span>")
+        report_title.set_margin_top(8)
+        report_title.set_margin_bottom(4)
+        self.report_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                                  spacing=3)
+        self.report_box.set_margin_bottom(6)
+        self.report_banner = Gtk.Label(xalign=0.0)
+        self.report_banner.set_line_wrap(True)
+        self.report_banner.get_style_context().add_class("report-banner")
+
         drawer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         drawer_box.pack_start(self.drawer_title, False, False, 0)
         drawer_box.pack_start(self.thumb, False, False, 0)
         drawer_box.pack_start(Gtk.Separator(
             orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
         drawer_box.pack_start(meta_scroll, True, True, 0)
+        drawer_box.pack_start(Gtk.Separator(
+            orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
+        drawer_box.pack_start(report_title, False, False, 0)
+        drawer_box.pack_start(self.report_box, False, False, 0)
+        drawer_box.pack_start(self.report_banner, False, False, 0)
 
         self.drawer = Gtk.Revealer()
         self.drawer.set_transition_type(
@@ -424,8 +490,8 @@ class WallprepApp(Gtk.Window):
             orientation=Gtk.Orientation.VERTICAL), False, False, 0)
         main_h.pack_start(self.drawer, False, False, 0)
 
-        # ---------------- bottom bar: Apply button ----------------
-        self.apply_btn = Gtk.Button(label="Apply")
+        # ---------------- bottom bar: Export button ----------------
+        self.apply_btn = Gtk.Button(label="Export private copies  →")
         self.apply_btn.get_style_context().add_class("apply-btn")
         self.apply_btn.set_tooltip_text(
             "Apply all staged operations — one output file per image, "
@@ -469,7 +535,36 @@ class WallprepApp(Gtk.Window):
         self.hint.set_margin_bottom(8)
         self.hint.get_style_context().add_class("dim-label")
 
+        # ---------------- privacy profile cards ----------------
+        prof_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        for m in ("set_margin_top", "set_margin_start", "set_margin_end"):
+            getattr(prof_row, m)(10)
+        prof_label = Gtk.Label(xalign=0.0)
+        prof_label.set_markup(
+            "<span weight='bold'>Privacy profile</span>")
+        prof_label.set_margin_start(10)
+        prof_label.set_margin_top(8)
+
+        self.profile_buttons = {}
+        for key in ("basic", "safe", "paranoid"):
+            prof = PROFILES[key]
+            btn = Gtk.Button()
+            btn.get_style_context().add_class("profile-card")
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            title = Gtk.Label(xalign=0.0)
+            title.set_markup(f"<span weight='bold'>{prof['label']}</span>")
+            desc = Gtk.Label(xalign=0.0, label=prof["desc"])
+            desc.get_style_context().add_class("dim-label")
+            inner.pack_start(title, False, False, 0)
+            inner.pack_start(desc, False, False, 0)
+            btn.add(inner)
+            btn.connect("clicked", self.on_select_profile, key)
+            self.profile_buttons[key] = btn
+            prof_row.pack_start(btn, False, False, 0)
+
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        vbox.pack_start(prof_label, False, False, 0)
+        vbox.pack_start(prof_row, False, False, 0)
         vbox.pack_start(bar, False, False, 0)
         vbox.pack_start(out_row, False, False, 0)
         vbox.pack_start(main_h, True, True, 0)
@@ -724,6 +819,7 @@ class WallprepApp(Gtk.Window):
                 self.meta_store.append([k, str(v)])
         threading.Thread(target=self._load_thumb, args=(path,),
                          daemon=True).start()
+        self._update_report()
 
     def _load_thumb(self, path):
         try:
@@ -841,6 +937,54 @@ class WallprepApp(Gtk.Window):
             GLib.idle_add(self._refresh_row, p)
         self._staging_hint()
 
+    def on_select_profile(self, _btn, key):
+        """Selecting a privacy profile sets the underlying controls and
+        stages every loaded image accordingly. The individual operation
+        buttons still work for fine-tuning afterward."""
+        prof = PROFILES[key]
+        # reflect the profile in the format dropdown + no-history toggle
+        self._syncing = True
+        fmt_idx = next((i for i, (_l, v) in enumerate(self.formats)
+                        if v == prof["format"]), 0)
+        self.format_combo.set_active(fmt_idx)
+        self._syncing = False
+        self.no_history_check.set_active(prof["no_history"])
+        # stage operations on every loaded image
+        target = int(self.width_spin.get_value())
+        taken = {st["new_name"] for st in self.info.values()
+                 if st["new_name"]}
+        for p in self.info:
+            st = self.info[p]
+            st["strip"] = prof["strip"]
+            if prof["resize"] and st["w"]:
+                st["resize_to"] = scaled_to_longest(st["w"], st["h"], target)
+            elif not prof["resize"]:
+                st["resize_to"] = None
+            if prof["rename"]:
+                if not st["new_name"]:
+                    ext = Path(p).suffix.lower().replace(".jpeg", ".jpg")
+                    while True:
+                        cand = random_name() + ext
+                        if cand not in taken:
+                            taken.add(cand)
+                            break
+                    st["new_name"] = cand
+            else:
+                st["new_name"] = None
+            self._refresh_row(p)
+        # highlight the selected card
+        for k, btn in self.profile_buttons.items():
+            ctx = btn.get_style_context()
+            if k == key:
+                ctx.add_class("selected")
+            else:
+                ctx.remove_class("selected")
+        self._update_report()
+        self._staging_hint()
+        self.hint.set_label(
+            f"Profile '{prof['label']}' applied to all images. Adjust "
+            "individually if needed, then Export.")
+
     def on_stage_clean(self, _btn):
         paths = self.selected_paths()
         all_staged = all(self.info[p]["strip"] for p in paths)
@@ -890,6 +1034,56 @@ class WallprepApp(Gtk.Window):
             "history, click Purge history. This does NOT remove AI "
             "watermarks or provider-side records.)")
 
+    def _update_report(self):
+        """Refresh the privacy-report checklist from the currently staged
+        operations (uses the selection if any, else the whole list)."""
+        for child in self.report_box.get_children():
+            self.report_box.remove(child)
+        sel = self.selected_paths()
+        states = [self.info[p] for p in sel if p in self.info]
+        if not states:
+            self.report_banner.set_text("")
+            return
+
+        def all_true(pred):
+            return all(pred(s) for s in states)
+
+        strip = all_true(lambda s: s["strip"])
+        renamed = all_true(lambda s: s["new_name"])
+        resized = all_true(lambda s: s["resize_to"])
+        fmt = self.target_format()
+        no_hist = self.no_history_check.get_active()
+
+        items = [
+            ("Metadata removed", strip),
+            ("ICC profile removed", strip),
+            ("Re-encoded (encoder trace gone)", strip),
+            ("Timestamp normalized", strip),
+            ("Random filename", renamed),
+            ("Resized", resized),
+            ("Forced JPG", fmt == "jpg"),
+            ("No app history", no_hist),
+        ]
+        for label, ok in items:
+            row = Gtk.Label(xalign=0.0)
+            mark = "✓" if ok else "○"
+            row.set_text(f"{mark}  {label}")
+            row.get_style_context().add_class(
+                "report-ok" if ok else "report-pending")
+            self.report_box.pack_start(row, False, False, 0)
+        self.report_box.show_all()
+
+        if strip:
+            self.report_banner.set_markup(
+                "<span weight='bold'>Your files are safe to share.</span>\n"
+                "<span size='small'>No metadata, profile, or timestamp "
+                "trace. (Does not affect AI watermarks or provider "
+                "records.)</span>")
+        else:
+            self.report_banner.set_markup(
+                "<span size='small'>Clean not staged — metadata will "
+                "remain. Stage Clean or pick a profile.</span>")
+
     def _update_counter(self):
         total = len(self.store)
         staged = sum(1 for st in self.info.values()
@@ -903,6 +1097,7 @@ class WallprepApp(Gtk.Window):
         n = sum(1 for st in self.info.values()
                 if st["resize_to"] or st["new_name"] or st["strip"])
         self._update_counter()
+        self._update_report()
         self.hint.set_label(
             f"{n} image(s) have staged operations — press Apply. "
             "Nothing is written until then." if n else
