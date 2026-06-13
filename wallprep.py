@@ -121,20 +121,6 @@ button.profile-card.selected {
 }
 """
 
-# Privacy profiles: each maps to a bundle of the underlying operations.
-# (Operations themselves stay available individually — profiles just set them.)
-PROFILES = {
-    "basic":    {"label": "Basic clean",   "desc": "Remove common metadata",
-                 "strip": True,  "rename": False, "resize": False,
-                 "format": None, "no_history": False},
-    "safe":     {"label": "Safe export",   "desc": "Good balance for sharing",
-                 "strip": True,  "rename": True,  "resize": True,
-                 "format": "jpg", "no_history": False},
-    "paranoid": {"label": "Paranoid",      "desc": "Maximum privacy",
-                 "strip": True,  "rename": True,  "resize": True,
-                 "format": "jpg", "no_history": True},
-}
-
 
 
 # ---------------- persistence helpers ----------------
@@ -294,28 +280,22 @@ class WallprepApp(Gtk.Window):
                   "set_margin_start", "set_margin_end"):
             getattr(bar, m)(10)
 
-        # --- Operations group ---
-        self.clean_btn = Gtk.Button(label="Clean")
-        self.clean_btn.set_tooltip_text(
-            "Stage a full anonymizing clean (preview only): remove ALL "
-            "metadata + ICC profile, re-encode with standardized generic "
-            "settings, and normalize the timestamp — so the output looks "
-            "like a plain, identical export with no trace of the source "
-            "tool")
-        self.clean_btn.connect("clicked", self.on_stage_clean)
+        # --- main operation: Clean + rename (one toggle) ---
+        self.cleanrename_btn = Gtk.ToggleButton(label="Clean + rename")
+        self.cleanrename_btn.set_tooltip_text(
+            "Remove all metadata + ICC profile, re-encode (kills the source "
+            "encoder trace), normalize the timestamp, and give a random "
+            "filename. This is the core privacy prep. Click to arm it for "
+            "all loaded images; click again to disarm.")
+        self.cleanrename_btn.connect("toggled", self.on_toggle_cleanrename)
 
-        self.rename_btn = Gtk.Button(label="Rename")
-        self.rename_btn.set_tooltip_text(
-            f"Stage a random {NAME_LENGTH}-character name (preview only)")
-        self.rename_btn.connect("clicked", self.on_stage_rename)
+        # --- optional resize ---
+        self.resize_check = Gtk.CheckButton(label="Resize to")
+        self.resize_check.set_tooltip_text(
+            "Also resize so the longest side matches the chosen size "
+            "(landscape -> width, portrait -> height).")
+        self.resize_check.connect("toggled", self.on_toggle_resize)
 
-        self.resize_btn = Gtk.Button(label="Resize")
-        self.resize_btn.set_tooltip_text(
-            "Stage a resize: the LONGEST side becomes this size "
-            "(landscape -> width, portrait -> height). Preview only.")
-        self.resize_btn.connect("clicked", self.on_stage_resize)
-
-        # resolution presets (value = longest side)
         self.presets = [("720p (HD)", 1280), ("1080p (FHD)", 1920),
                         ("1440p (QHD)", 2560), ("4K UHD", 3840),
                         ("8K UHD", 7680), ("Custom", None)]
@@ -334,9 +314,8 @@ class WallprepApp(Gtk.Window):
         self.preset_combo.connect("changed", self.on_preset_changed)
         self.width_spin.connect("value-changed", self.on_width_changed)
 
-        ops_group = group("OPERATIONS", self.clean_btn, self.rename_btn,
-                          self.resize_btn, self.preset_combo,
-                          self.width_spin, px_label)
+        ops_group = group("PREP", self.cleanrename_btn, self.resize_check,
+                          self.preset_combo, self.width_spin, px_label)
 
         # --- Output group ---
         self.formats = [("Keep original", None), ("JPG", "jpg"),
@@ -537,36 +516,7 @@ class WallprepApp(Gtk.Window):
         self.hint.set_margin_bottom(8)
         self.hint.get_style_context().add_class("dim-label")
 
-        # ---------------- privacy profile cards ----------------
-        prof_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        for m in ("set_margin_top", "set_margin_start", "set_margin_end"):
-            getattr(prof_row, m)(10)
-        prof_label = Gtk.Label(xalign=0.0)
-        prof_label.set_markup(
-            "<span weight='bold'>Privacy profile</span>")
-        prof_label.set_margin_start(10)
-        prof_label.set_margin_top(8)
-
-        self.profile_buttons = {}
-        for key in ("basic", "safe", "paranoid"):
-            prof = PROFILES[key]
-            btn = Gtk.Button()
-            btn.get_style_context().add_class("profile-card")
-            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            title = Gtk.Label(xalign=0.0)
-            title.set_markup(f"<span weight='bold'>{prof['label']}</span>")
-            desc = Gtk.Label(xalign=0.0, label=prof["desc"])
-            desc.get_style_context().add_class("dim-label")
-            inner.pack_start(title, False, False, 0)
-            inner.pack_start(desc, False, False, 0)
-            btn.add(inner)
-            btn.connect("clicked", self.on_select_profile, key)
-            self.profile_buttons[key] = btn
-            prof_row.pack_start(btn, False, False, 0)
-
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        vbox.pack_start(prof_label, False, False, 0)
-        vbox.pack_start(prof_row, False, False, 0)
         vbox.pack_start(bar, False, False, 0)
         vbox.pack_start(out_row, False, False, 0)
         vbox.pack_start(main_h, True, True, 0)
@@ -857,10 +807,7 @@ class WallprepApp(Gtk.Window):
             self._update_report()
 
     def set_ops_sensitive(self, state):
-        for b in (self.resize_btn, self.rename_btn,
-                  self.clean_btn, self.apply_btn):
-            b.set_sensitive(state)
-        for b in self.profile_buttons.values():
+        for b in (self.cleanrename_btn, self.resize_check, self.apply_btn):
             b.set_sensitive(state)
 
     def output_dir(self):
@@ -900,6 +847,7 @@ class WallprepApp(Gtk.Window):
         if self._syncing:
             return
         self._sync_preset_combo()
+        self._restage_resize()
 
     def on_reset_status(self, _btn):
         paths = self.selected_paths()
@@ -920,63 +868,15 @@ class WallprepApp(Gtk.Window):
             "and 'done' memory cleared.")
 
     # ================= staging (preview only) =================
-    def on_stage_resize(self, _btn):
-        target = int(self.width_spin.get_value())
-        paths = self.selected_paths()
-        all_staged = all(self.info[p]["resize_to"] for p in paths)
-        for p in paths:
-            st = self.info[p]
-            if all_staged:
-                st["resize_to"] = None
-            elif st["w"]:
-                st["resize_to"] = scaled_to_longest(st["w"], st["h"], target)
-            GLib.idle_add(self._refresh_row, p)
-        self._staging_hint()
-
-    def on_stage_rename(self, _btn):
-        paths = self.selected_paths()
-        all_staged = all(self.info[p]["new_name"] for p in paths)
-        taken = {st["new_name"] for st in self.info.values()
-                 if st["new_name"]}
-        for p in paths:
-            st = self.info[p]
-            if all_staged:
-                st["new_name"] = None
-            else:
-                ext = Path(p).suffix.lower().replace(".jpeg", ".jpg")
-                while True:
-                    cand = random_name() + ext
-                    if cand not in taken:
-                        taken.add(cand)
-                        break
-                st["new_name"] = cand
-            GLib.idle_add(self._refresh_row, p)
-        self._staging_hint()
-
-    def on_select_profile(self, _btn, key):
-        """Selecting a privacy profile sets the underlying controls and
-        stages every loaded image accordingly. The individual operation
-        buttons still work for fine-tuning afterward."""
-        prof = PROFILES[key]
-        # reflect the profile in the format dropdown + no-history toggle
-        self._syncing = True
-        fmt_idx = next((i for i, (_l, v) in enumerate(self.formats)
-                        if v == prof["format"]), 0)
-        self.format_combo.set_active(fmt_idx)
-        self._syncing = False
-        self.no_history_check.set_active(prof["no_history"])
-        # stage operations on every loaded image
-        target = int(self.width_spin.get_value())
+    def on_toggle_cleanrename(self, btn):
+        """Arm/disarm Clean + rename for all loaded images."""
+        on = btn.get_active()
         taken = {st["new_name"] for st in self.info.values()
                  if st["new_name"]}
         for p in self.info:
             st = self.info[p]
-            st["strip"] = prof["strip"]
-            if prof["resize"] and st["w"]:
-                st["resize_to"] = scaled_to_longest(st["w"], st["h"], target)
-            elif not prof["resize"]:
-                st["resize_to"] = None
-            if prof["rename"]:
+            st["strip"] = on
+            if on:
                 if not st["new_name"]:
                     ext = Path(p).suffix.lower().replace(".jpeg", ".jpg")
                     while True:
@@ -988,25 +888,32 @@ class WallprepApp(Gtk.Window):
             else:
                 st["new_name"] = None
             self._refresh_row(p)
-        # highlight the selected card
-        for k, btn in self.profile_buttons.items():
-            ctx = btn.get_style_context()
-            if k == key:
-                ctx.add_class("selected")
-            else:
-                ctx.remove_class("selected")
-        self._update_report()
         self._staging_hint()
-        self.hint.set_label(
-            f"Profile '{prof['label']}' applied to all images. Adjust "
-            "individually if needed, then Export.")
 
-    def on_stage_clean(self, _btn):
-        paths = self.selected_paths()
-        all_staged = all(self.info[p]["strip"] for p in paths)
-        for p in paths:
-            self.info[p]["strip"] = not all_staged
-            GLib.idle_add(self._refresh_row, p)
+    def on_toggle_resize(self, check):
+        """Arm/disarm resize for all loaded images."""
+        on = check.get_active()
+        target = int(self.width_spin.get_value())
+        for p in self.info:
+            st = self.info[p]
+            if on and st["w"]:
+                st["resize_to"] = scaled_to_longest(st["w"], st["h"], target)
+            elif not on:
+                st["resize_to"] = None
+            self._refresh_row(p)
+        self._staging_hint()
+
+    def _restage_resize(self):
+        """Re-apply resize to all images at the current size (used when the
+        size selector changes while resize is armed)."""
+        if not self.resize_check.get_active():
+            return
+        target = int(self.width_spin.get_value())
+        for p in self.info:
+            st = self.info[p]
+            if st["w"]:
+                st["resize_to"] = scaled_to_longest(st["w"], st["h"], target)
+            self._refresh_row(p)
         self._staging_hint()
 
     def _update_report(self):
