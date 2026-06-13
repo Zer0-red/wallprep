@@ -1101,12 +1101,12 @@ class WallprepApp(Gtk.Window):
             # physically sideways
             cmd += ["-auto-orient"]
             if resized:
-                # use a longest-side FIT geometry ('NNNxNNN>') rather than
-                # forced exact dimensions: this stays correct even after
-                # -auto-orient swaps a rotated image's width/height, and the
-                # '>' means it only ever shrinks past the target
+                # longest-side FIT geometry, no '>' so images SMALLER than
+                # the target are enlarged too (output matches the preview).
+                # Fit (not forced '!') stays correct after -auto-orient
+                # swaps a rotated image's width/height.
                 longest = max(st["resize_to"])
-                cmd += ["-resize", f"{longest}x{longest}>"]
+                cmd += ["-resize", f"{longest}x{longest}"]
             if flatten:
                 cmd += ["-background", "white", "-alpha", "remove",
                         "-alpha", "off"]
