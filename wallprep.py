@@ -42,7 +42,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 
 SUPPORTED = {".jpg", ".jpeg", ".png", ".webp"}
-NAME_LENGTH = 5
+NAME_LENGTH = 12
 CONFIG_DIR = Path.home() / ".config" / "wallprep"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 PROCESSED_FILE = CONFIG_DIR / "processed.json"
@@ -117,12 +117,27 @@ def fingerprint(path: str) -> str:
 
 # ---------------- image helpers ----------------
 def read_metadata(path: str) -> dict:
+    """Lenient read for the preview column — returns {} on any failure."""
     try:
         out = subprocess.run(["exiftool", "-j", "-G0", path],
                              capture_output=True, text=True, timeout=30)
         data = json.loads(out.stdout)[0]
     except Exception:
         return {}
+    return {k: v for k, v in data.items()
+            if k.split(":")[-1] not in BORING_TAGS}
+
+
+def read_metadata_strict(path: str) -> dict:
+    """Strict read for VERIFICATION — raises on failure instead of
+    returning {}, so a crashed/timed-out exiftool can never be mistaken
+    for a clean result and pass verification."""
+    out = subprocess.run(["exiftool", "-j", "-G0", path],
+                         capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"exiftool exited {out.returncode}: {out.stderr.strip()[:120]}")
+    data = json.loads(out.stdout)[0]  # raises if output is malformed/empty
     return {k: v for k, v in data.items()
             if k.split(":")[-1] not in BORING_TAGS}
 
@@ -259,20 +274,40 @@ class WallprepApp(Gtk.Window):
         self.all_btn.connect("clicked", self.on_stage_all)
         bar.pack_start(self.all_btn, False, False, 0)
 
+        self.safe_btn = Gtk.Button(label="Safe")
+        self.safe_btn.set_tooltip_text(
+            "Maximum privacy in one click: Clean + Rename + Resize, and "
+            "forces output to flattened JPG. Not the default — your Format "
+            "choice is left untouched for normal use.")
+        self.safe_btn.connect("clicked", self.on_stage_safe)
+        bar.pack_start(self.safe_btn, False, False, 0)
+
         bar.pack_start(Gtk.Label(label="Format:"), False, False, 0)
         self.formats = [("Keep original", None), ("JPG", "jpg"),
                         ("PNG", "png")]
         self.format_combo = Gtk.ComboBoxText()
         for label, _v in self.formats:
             self.format_combo.append_text(label)
-        saved_fmt = self.cfg.get("out_format")  # None / "jpg" / "png"
+        # default to JPG unless the user previously chose otherwise
+        saved_fmt = self.cfg.get("out_format", "jpg")  # None / "jpg" / "png"
         self.format_combo.set_active(
             next((i for i, (_l, v) in enumerate(self.formats)
-                  if v == saved_fmt), 0))
+                  if v == saved_fmt), 1))  # index 1 = JPG fallback
         self.format_combo.set_tooltip_text(
             "Output format. 'Keep original' preserves each image's format. "
-            "JPG = small, PNG = lossless.")
+            "JPG = small (default), PNG = lossless.")
         bar.pack_start(self.format_combo, False, False, 0)
+
+        self.no_history_check = Gtk.CheckButton(label="No history")
+        self.no_history_check.set_tooltip_text(
+            "Don't record processed images to the local history file. "
+            "Normally wallprep remembers what it processed (to show "
+            "'done ✓') — but that log links your originals to their "
+            "outputs. With this on, nothing is written to disk about "
+            "what you processed.")
+        self.no_history_check.set_active(bool(self.cfg.get("no_history",
+                                                           False)))
+        bar.pack_start(self.no_history_check, False, False, 0)
 
         self.reset_btn = Gtk.Button(label="Reset status")
         self.reset_btn.set_tooltip_text(
@@ -418,6 +453,7 @@ class WallprepApp(Gtk.Window):
         self.cfg["output_dir"] = self.out_btn.get_filename()
         self.cfg["width"] = int(self.width_spin.get_value())
         self.cfg["out_format"] = self.target_format()
+        self.cfg["no_history"] = self.no_history_check.get_active()
         save_json(CONFIG_FILE, self.cfg)
         save_json(PROCESSED_FILE, self.processed)
         Gtk.main_quit()
@@ -600,7 +636,8 @@ class WallprepApp(Gtk.Window):
 
     def set_ops_sensitive(self, state):
         for b in (self.resize_btn, self.rename_btn,
-                  self.clean_btn, self.all_btn, self.apply_btn):
+                  self.clean_btn, self.all_btn, self.safe_btn,
+                  self.apply_btn):
             b.set_sensitive(state)
 
     def output_dir(self):
@@ -723,6 +760,22 @@ class WallprepApp(Gtk.Window):
             GLib.idle_add(self._refresh_row, p)
         self._staging_hint()
 
+    def on_stage_safe(self, _btn):
+        """One-click maximum privacy: stage Clean + Rename + Resize AND
+        force the output format to JPG (flattened). Sets the Format dropdown
+        to JPG so the choice is visible, not hidden."""
+        self.on_stage_all(_btn)
+        # force JPG output so the result is flattened & uniformly re-encoded
+        jpg_idx = next((i for i, (_l, v) in enumerate(self.formats)
+                        if v == "jpg"), None)
+        if jpg_idx is not None:
+            self.format_combo.set_active(jpg_idx)
+        self.hint.set_label(
+            "Safe mode staged: Clean + Rename + Resize, output forced to "
+            "JPG. Press Apply. (This removes metadata/profile/timestamp and "
+            "randomizes names — it does NOT remove AI watermarks or "
+            "provider-side records.)")
+
     def _staging_hint(self):
         n = sum(1 for st in self.info.values()
                 if st["resize_to"] or st["new_name"] or st["strip"])
@@ -744,6 +797,7 @@ class WallprepApp(Gtk.Window):
             if has_staged or out_format:
                 job = dict(st)
                 job["out_format"] = out_format
+                job["no_history"] = self.no_history_check.get_active()
                 jobs.append((p, job))
         if not jobs:
             self.hint.set_label(
@@ -766,15 +820,17 @@ class WallprepApp(Gtk.Window):
                 verified, problem = self._verify(dest, st)
                 if verified:
                     ok += 1
-                    # remember this source file as processed
-                    try:
-                        self.processed[fingerprint(path)] = {
-                            "output": str(dest),
-                            "date": time.strftime("%Y-%m-%d %H:%M"),
-                        }
-                        save_json(PROCESSED_FILE, self.processed)
-                    except Exception:
-                        pass
+                    if not st.get("no_history"):
+                        # remember this source file as processed (the log
+                        # links originals to outputs — skipped in no-history)
+                        try:
+                            self.processed[fingerprint(path)] = {
+                                "output": str(dest),
+                                "date": time.strftime("%Y-%m-%d %H:%M"),
+                            }
+                            save_json(PROCESSED_FILE, self.processed)
+                        except Exception:
+                            pass
                     self.info[path].update(resize_to=None, new_name=None,
                                            strip=False, done=str(dest))
                     GLib.idle_add(self._refresh_row, path)
@@ -799,6 +855,10 @@ class WallprepApp(Gtk.Window):
         else:
             ext = src.suffix
         ext = ext.lower().replace(".jpeg", ".jpg")
+        # A Clean operation re-encodes with standardized JPG/PNG settings, so
+        # it can't sensibly emit WebP — redirect a WebP-bound Clean to JPG.
+        if strip and ext == ".webp":
+            ext = ".jpg"
         # resolve output stem
         stem = Path(st["new_name"]).stem if st["new_name"] else src.stem
         dest = out / (stem + ext)
@@ -812,12 +872,30 @@ class WallprepApp(Gtk.Window):
                                        or st["resize_to"][1] != st["h"])
         # a format change forces a re-encode even if nothing else changed
         changing_format = ext != src.suffix.lower().replace(".jpeg", ".jpg")
+        # JPEG has no alpha — flatten transparency onto white so transparent
+        # regions don't become black/garbage in the output.
+        flatten = ext == ".jpg"
 
-        if strip or resized or changing_format:
+        if strip or resized or changing_format or flatten:
             cmd = ["convert", str(src)]
+            # bake any EXIF orientation into the pixels BEFORE stripping —
+            # otherwise removing the orientation tag can leave the image
+            # physically sideways
+            cmd += ["-auto-orient"]
             if resized:
-                cmd += ["-resize",
-                        f"{st['resize_to'][0]}x{st['resize_to'][1]}!"]
+                # use a longest-side FIT geometry ('NNNxNNN>') rather than
+                # forced exact dimensions: this stays correct even after
+                # -auto-orient swaps a rotated image's width/height, and the
+                # '>' means it only ever shrinks past the target
+                longest = max(st["resize_to"])
+                cmd += ["-resize", f"{longest}x{longest}>"]
+            if flatten:
+                cmd += ["-background", "white", "-alpha", "remove",
+                        "-alpha", "off"]
+            # normalize to plain 8-bit sRGB so 16-bit / CMYK / wide-gamut
+            # sources all become bog-standard images (uniform + no exotic
+            # bit-depth or colorspace acting as a fingerprint)
+            cmd += ["-colorspace", "sRGB", "-depth", "8"]
             if strip:
                 # full clean: drop metadata/profiles AND re-encode with
                 # standardized generic settings so the output carries no
@@ -828,7 +906,7 @@ class WallprepApp(Gtk.Window):
                             "-define", "png:compression-level=9"]
                 else:  # jpg
                     cmd += ["-sampling-factor", "4:2:0",
-                            "-quality", "90", "-interlace", "none"]
+                            "-quality", "92", "-interlace", "none"]
             cmd += [str(dest)]
             subprocess.run(cmd, check=True, capture_output=True, timeout=120)
         else:
@@ -843,26 +921,34 @@ class WallprepApp(Gtk.Window):
         return dest
 
     def _verify(self, dest: Path, st: dict):
-        """Independently re-check the output file against what was staged."""
-        out_format = st.get("out_format")
+        """Independently re-check the output file against what was staged.
+        Raises on tool failure (caught by the caller) rather than silently
+        passing — a clean check must never come from a crashed reader."""
         strip = st["strip"]
         if not dest.exists():
             return False, "output file missing"
-        if out_format and dest.suffix.lower().replace(".jpeg", ".jpg") \
-                != "." + out_format:
-            return False, f"output is not {out_format.upper()}"
         if st["resize_to"]:
             w, h = image_dimensions(str(dest))
-            if (w, h) != tuple(st["resize_to"]):
-                return False, f"size is {w}×{h}, expected " \
-                              f"{st['resize_to'][0]}×{st['resize_to'][1]}"
+            target = max(st["resize_to"])
+            # after auto-orient + fit resize, the LONGEST side should equal
+            # the target (unless the source was already smaller, in which
+            # case '>' left it unchanged and the longest side is ≤ target)
+            if w is None:
+                return False, "could not read output dimensions"
+            if max(w, h) > target:
+                return False, f"longest side is {max(w, h)}, expected " \
+                              f"≤ {target}"
         if strip:
-            leftover = read_metadata(str(dest))
+            # strict read: raises if exiftool fails, so we can't mistake an
+            # unreadable file for a clean one
+            leftover = read_metadata_strict(str(dest))
             if leftover:
                 return False, f"{len(leftover)} metadata tag(s) remain"
             icc = subprocess.run(
                 ["exiftool", "-ICC_Profile:all", str(dest)],
                 capture_output=True, text=True, timeout=30)
+            if icc.returncode != 0:
+                return False, "could not verify ICC profile (exiftool failed)"
             if icc.stdout.strip():
                 return False, "ICC color profile remains"
         if dest.suffix.lower() not in SUPPORTED:
@@ -878,9 +964,11 @@ class WallprepApp(Gtk.Window):
     def _done(self, ok, total, out):
         self.busy = False
         self.set_ops_sensitive(True)
+        note = ("✓ file-level anonymity (metadata, profile, timestamp, "
+                "encoder) — does not remove AI watermarks or provider "
+                "records; check visible content yourself")
         self.hint.set_label(
-            f"Done — {ok}/{total} file(s) written to {out} and verified "
-            "(originals untouched)")
+            f"Done — {ok}/{total} verified, written to {out}. {note}")
         return False
 
     # ================= misc =================
@@ -888,7 +976,40 @@ class WallprepApp(Gtk.Window):
         subprocess.Popen(["xdg-open", str(self.output_dir())])
 
 
+def check_dependencies():
+    """Return a list of (command, install_hint) for any missing tools."""
+    needed = [
+        ("exiftool", "sudo apt install libimage-exiftool-perl"),
+        ("convert", "sudo apt install imagemagick"),
+        ("identify", "sudo apt install imagemagick"),
+    ]
+    missing = []
+    for cmd, hint in needed:
+        if shutil.which(cmd) is None:
+            missing.append((cmd, hint))
+    return missing
+
+
+def show_dependency_error(missing):
+    lines = "\n".join(f"  • {cmd} — install with:  {hint}"
+                      for cmd, hint in missing)
+    dialog = Gtk.MessageDialog(
+        transient_for=None, modal=True,
+        message_type=Gtk.MessageType.ERROR,
+        buttons=Gtk.ButtonsType.OK,
+        text="Missing required tools")
+    dialog.format_secondary_text(
+        f"wallprep needs these command-line tools, which weren't found:\n\n"
+        f"{lines}\n\nInstall them and restart.")
+    dialog.run()
+    dialog.destroy()
+
+
 if __name__ == "__main__":
+    missing = check_dependencies()
+    if missing:
+        show_dependency_error(missing)
+        raise SystemExit(1)
     win = WallprepApp()
     win.show_all()
     Gtk.main()
