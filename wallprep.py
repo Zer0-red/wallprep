@@ -241,13 +241,13 @@ class WallprepApp(Gtk.Window):
         header = Gtk.HeaderBar(title="wallprep", show_close_button=True)
         self.set_titlebar(header)
 
-        add_folder = Gtk.Button(label="Add folder…")
-        add_folder.connect("clicked", self.on_add_folder)
-        header.pack_start(add_folder)
-
         add_files = Gtk.Button(label="Add images…")
         add_files.connect("clicked", self.on_add_files)
         header.pack_start(add_files)
+
+        add_folder = Gtk.Button(label="Add folder…")
+        add_folder.connect("clicked", self.on_add_folder)
+        header.pack_start(add_folder)
 
         clear_btn = Gtk.Button.new_from_icon_name(
             "edit-clear-all-symbolic", Gtk.IconSize.BUTTON)
@@ -255,13 +255,24 @@ class WallprepApp(Gtk.Window):
         clear_btn.connect("clicked", self.on_clear)
         header.pack_start(clear_btn)
 
-        self.drawer_btn = Gtk.ToggleButton()
-        self.drawer_btn.set_image(Gtk.Image.new_from_icon_name(
-            "view-dual-symbolic", Gtk.IconSize.BUTTON))
-        self.drawer_btn.set_tooltip_text("Show/hide preview drawer")
-        self.drawer_btn.set_active(True)
-        self.drawer_btn.connect("toggled", self.on_drawer_toggle)
-        header.pack_end(self.drawer_btn)
+        # small gap, then list/log management
+        gap = Gtk.Box()
+        gap.set_size_request(24, 1)
+        header.pack_start(gap)
+
+        self.reset_btn = Gtk.Button(label="Reset status")
+        self.reset_btn.set_tooltip_text(
+            "Clear staged operations AND the remembered 'done' state of the "
+            "selected images, so they can be processed fresh")
+        self.reset_btn.connect("clicked", self.on_reset_status)
+        header.pack_start(self.reset_btn)
+
+        self.purge_btn = Gtk.Button(label="Purge history")
+        self.purge_btn.set_tooltip_text(
+            "Delete the entire local processing log (with confirmation). "
+            "Affects only the log, not your image files.")
+        self.purge_btn.connect("clicked", self.on_purge_history)
+        header.pack_start(self.purge_btn)
 
         # ---------------- toolbar (grouped) ----------------
         def group(title, *widgets):
@@ -327,23 +338,6 @@ class WallprepApp(Gtk.Window):
                           self.resize_btn, self.preset_combo,
                           self.width_spin, px_label)
 
-        # --- Presets group ---
-        self.all_btn = Gtk.Button(label="Full clean")
-        self.all_btn.set_tooltip_text(
-            "Full clean: stage Clean + Rename + Resize together (preview "
-            "only). Respects your current Format and No-history choices.")
-        self.all_btn.connect("clicked", self.on_stage_all)
-
-        self.safe_btn = Gtk.Button(label="Paranoid")
-        self.safe_btn.set_tooltip_text(
-            "Paranoid: maximum privacy in one click — Clean + Rename + "
-            "Resize, forces JPG output, and turns on No-history so future "
-            "processing isn't logged. (To erase an existing log too, use "
-            "Purge history.)")
-        self.safe_btn.connect("clicked", self.on_stage_safe)
-
-        presets_group = group("PRESETS", self.all_btn, self.safe_btn)
-
         # --- Output group ---
         self.formats = [("Keep original", None), ("JPG", "jpg"),
                         ("PNG", "png")]
@@ -376,8 +370,6 @@ class WallprepApp(Gtk.Window):
             return Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
 
         bar.pack_start(ops_group, False, False, 0)
-        bar.pack_start(divider(), False, False, 0)
-        bar.pack_start(presets_group, False, False, 0)
         bar.pack_start(divider(), False, False, 0)
         bar.pack_start(output_group, False, False, 0)
 
@@ -431,10 +423,10 @@ class WallprepApp(Gtk.Window):
         list_scroll.add(self.tree)
 
         # ---------------- drawer: thumbnail + metadata ----------------
-        self.drawer_title = Gtk.Label(label="Preview")
+        self.drawer_title = Gtk.Label(label="Preview", xalign=0.0)
+        self.drawer_title.set_ellipsize(3)  # Pango.EllipsizeMode.END
         self.drawer_title.set_margin_top(8)
         self.drawer_title.set_margin_bottom(4)
-        self.drawer_title.set_ellipsize(3)  # Pango.EllipsizeMode.END
 
         self.thumb = Gtk.Image()
         self.thumb.set_margin_bottom(6)
@@ -453,17 +445,29 @@ class WallprepApp(Gtk.Window):
         meta_scroll.set_vexpand(True)
         meta_scroll.add(meta_tree)
 
-        # privacy report: live checklist of what export will do
-        report_title = Gtk.Label(xalign=0.0)
-        report_title.set_markup("<span weight='bold'>Privacy report</span>")
-        report_title.set_margin_top(8)
-        report_title.set_margin_bottom(4)
+        # privacy report: collapsible. The title acts as a show/hide toggle.
+        self.report_toggle = Gtk.Button()
+        self.report_toggle.set_relief(Gtk.ReliefStyle.NONE)
+        self.report_toggle_label = Gtk.Label(xalign=0.0)
+        self.report_toggle.add(self.report_toggle_label)
+        self.report_toggle.connect("clicked", self.on_report_toggle)
+        self.report_open = bool(self.cfg.get("report_open", False))
+
         self.report_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
                                   spacing=3)
         self.report_box.set_margin_bottom(6)
         self.report_banner = Gtk.Label(xalign=0.0)
         self.report_banner.set_line_wrap(True)
         self.report_banner.get_style_context().add_class("report-banner")
+        report_inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                               spacing=4)
+        report_inner.pack_start(self.report_box, False, False, 0)
+        report_inner.pack_start(self.report_banner, False, False, 0)
+        self.report_reveal = Gtk.Revealer()
+        self.report_reveal.set_transition_type(
+            Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self.report_reveal.add(report_inner)
+        self.report_reveal.set_reveal_child(self.report_open)
 
         drawer_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         drawer_box.pack_start(self.drawer_title, False, False, 0)
@@ -473,9 +477,9 @@ class WallprepApp(Gtk.Window):
         drawer_box.pack_start(meta_scroll, True, True, 0)
         drawer_box.pack_start(Gtk.Separator(
             orientation=Gtk.Orientation.HORIZONTAL), False, False, 0)
-        drawer_box.pack_start(report_title, False, False, 0)
-        drawer_box.pack_start(self.report_box, False, False, 0)
-        drawer_box.pack_start(self.report_banner, False, False, 0)
+        drawer_box.pack_start(self.report_toggle, False, False, 0)
+        drawer_box.pack_start(self.report_reveal, False, False, 0)
+        self._update_report_toggle_label()
 
         self.drawer = Gtk.Revealer()
         self.drawer.set_transition_type(
@@ -484,10 +488,22 @@ class WallprepApp(Gtk.Window):
         self.drawer.add(drawer_box)
         self.drawer.set_size_request(THUMB_WIDTH + 40, -1)
 
+        # collapse button sits just outside the drawer, so it stays visible
+        # even when the drawer is hidden
+        self.drawer_btn = Gtk.ToggleButton()
+        self.drawer_btn.set_image(Gtk.Image.new_from_icon_name(
+            "view-dual-symbolic", Gtk.IconSize.BUTTON))
+        self.drawer_btn.set_tooltip_text("Show/hide the preview panel")
+        self.drawer_btn.set_active(True)
+        self.drawer_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.drawer_btn.set_valign(Gtk.Align.START)
+        self.drawer_btn.connect("toggled", self.on_drawer_toggle)
+
         main_h = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         main_h.pack_start(list_scroll, True, True, 0)
         main_h.pack_start(Gtk.Separator(
             orientation=Gtk.Orientation.VERTICAL), False, False, 0)
+        main_h.pack_start(self.drawer_btn, False, False, 0)
         main_h.pack_start(self.drawer, False, False, 0)
 
         # ---------------- bottom bar: Export button ----------------
@@ -503,26 +519,12 @@ class WallprepApp(Gtk.Window):
         sel_all.connect("clicked",
                         lambda *_: self.tree.get_selection().select_all())
 
-        self.reset_btn = Gtk.Button(label="Reset status")
-        self.reset_btn.set_tooltip_text(
-            "Clear staged operations AND the remembered 'done' state of the "
-            "selected images, so they can be processed fresh")
-        self.reset_btn.connect("clicked", self.on_reset_status)
-
-        self.purge_btn = Gtk.Button(label="Purge history")
-        self.purge_btn.set_tooltip_text(
-            "Delete the entire local processing log (with confirmation). "
-            "Affects only the log, not your image files.")
-        self.purge_btn.connect("clicked", self.on_purge_history)
-
         bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         bottom.set_margin_top(8)
         bottom.set_margin_bottom(4)
         bottom.set_margin_start(10)
         bottom.set_margin_end(10)
         bottom.pack_start(sel_all, False, False, 0)
-        bottom.pack_start(self.reset_btn, False, False, 0)
-        bottom.pack_start(self.purge_btn, False, False, 0)
         self.counter = Gtk.Label(xalign=0.0)
         self.counter.get_style_context().add_class("dim-label")
         bottom.pack_start(self.counter, True, True, 8)
@@ -634,6 +636,7 @@ class WallprepApp(Gtk.Window):
         self.cfg["width"] = int(self.width_spin.get_value())
         self.cfg["out_format"] = self.target_format()
         self.cfg["no_history"] = self.no_history_check.get_active()
+        self.cfg["report_open"] = self.report_open
         save_json(CONFIG_FILE, self.cfg)
         if not self.no_history_check.get_active():
             save_json(PROCESSED_FILE, self.processed)
@@ -841,10 +844,23 @@ class WallprepApp(Gtk.Window):
     def on_drawer_toggle(self, btn):
         self.drawer.set_reveal_child(btn.get_active())
 
+    def _update_report_toggle_label(self):
+        arrow = "▾" if self.report_open else "▸"
+        self.report_toggle_label.set_markup(
+            f"<span weight='bold'>{arrow}  Privacy report</span>")
+
+    def on_report_toggle(self, _btn):
+        self.report_open = not self.report_open
+        self.report_reveal.set_reveal_child(self.report_open)
+        self._update_report_toggle_label()
+        if self.report_open:
+            self._update_report()
+
     def set_ops_sensitive(self, state):
         for b in (self.resize_btn, self.rename_btn,
-                  self.clean_btn, self.all_btn, self.safe_btn,
-                  self.apply_btn):
+                  self.clean_btn, self.apply_btn):
+            b.set_sensitive(state)
+        for b in self.profile_buttons.values():
             b.set_sensitive(state)
 
     def output_dir(self):
@@ -993,50 +1009,11 @@ class WallprepApp(Gtk.Window):
             GLib.idle_add(self._refresh_row, p)
         self._staging_hint()
 
-    def on_stage_all(self, _btn):
-        """Stage Clean + Rename + Resize for the selection in one click."""
-        target = int(self.width_spin.get_value())
-        paths = self.selected_paths()
-        taken = {st["new_name"] for st in self.info.values()
-                 if st["new_name"]}
-        for p in paths:
-            st = self.info[p]
-            st["strip"] = True
-            if st["w"]:
-                st["resize_to"] = scaled_to_longest(st["w"], st["h"], target)
-            if not st["new_name"]:
-                ext = Path(p).suffix.lower().replace(".jpeg", ".jpg")
-                while True:
-                    cand = random_name() + ext
-                    if cand not in taken:
-                        taken.add(cand)
-                        break
-                st["new_name"] = cand
-            GLib.idle_add(self._refresh_row, p)
-        self._staging_hint()
-
-    def on_stage_safe(self, _btn):
-        """Paranoid: one-click maximum privacy — stage Clean + Rename +
-        Resize, force the output format to JPG (flattened), AND enable
-        No-history so no local source-to-output trail is left behind."""
-        self.on_stage_all(_btn)
-        # force JPG output so the result is flattened & uniformly re-encoded
-        jpg_idx = next((i for i, (_l, v) in enumerate(self.formats)
-                        if v == "jpg"), None)
-        if jpg_idx is not None:
-            self.format_combo.set_active(jpg_idx)
-        # enable no-history going forward (does not auto-delete the existing
-        # log — that's the deliberate, confirmed Purge history button)
-        self.no_history_check.set_active(True)
-        self.hint.set_label(
-            "Paranoid staged: Clean + Rename + Resize, output forced to "
-            "JPG, future logging off. Press Apply. (To also erase past "
-            "history, click Purge history. This does NOT remove AI "
-            "watermarks or provider-side records.)")
-
     def _update_report(self):
         """Refresh the privacy-report checklist from the currently staged
         operations (uses the selection if any, else the whole list)."""
+        if not getattr(self, "report_open", False):
+            return
         for child in self.report_box.get_children():
             self.report_box.remove(child)
         sel = self.selected_paths()
