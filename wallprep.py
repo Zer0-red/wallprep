@@ -207,7 +207,11 @@ class WallprepApp(Gtk.Window):
 
         self.clean_btn = Gtk.Button(label="Clean")
         self.clean_btn.set_tooltip_text(
-            "Stage metadata removal (preview only)")
+            "Stage a full anonymizing clean (preview only): remove ALL "
+            "metadata + ICC profile, re-encode with standardized generic "
+            "settings, and normalize the timestamp — so the output looks "
+            "like a plain, identical export with no trace of the source "
+            "tool")
         self.clean_btn.connect("clicked", self.on_stage_clean)
         bar.pack_start(self.clean_btn, False, False, 0)
 
@@ -255,15 +259,6 @@ class WallprepApp(Gtk.Window):
         self.all_btn.connect("clicked", self.on_stage_all)
         bar.pack_start(self.all_btn, False, False, 0)
 
-        self.neutralize_check = Gtk.CheckButton(label="Neutralize")
-        self.neutralize_check.set_tooltip_text(
-            "Maximum anonymity: re-encode every output with standardized, "
-            "metadata-free settings and normalized timestamps, so all "
-            "outputs look like generic, identical exports. Implies Clean.")
-        self.neutralize_check.set_active(bool(self.cfg.get("neutralize",
-                                                           False)))
-        bar.pack_start(self.neutralize_check, False, False, 0)
-
         bar.pack_start(Gtk.Label(label="Format:"), False, False, 0)
         self.formats = [("Keep original", None), ("JPG", "jpg"),
                         ("PNG", "png")]
@@ -275,9 +270,8 @@ class WallprepApp(Gtk.Window):
             next((i for i, (_l, v) in enumerate(self.formats)
                   if v == saved_fmt), 0))
         self.format_combo.set_tooltip_text(
-            "Output format. 'Keep original' preserves each image's format "
-            "(except portraits already handled by resize). JPG = small, "
-            "PNG = lossless.")
+            "Output format. 'Keep original' preserves each image's format. "
+            "JPG = small, PNG = lossless.")
         bar.pack_start(self.format_combo, False, False, 0)
 
         self.reset_btn = Gtk.Button(label="Reset status")
@@ -423,7 +417,6 @@ class WallprepApp(Gtk.Window):
     def on_destroy(self, _win):
         self.cfg["output_dir"] = self.out_btn.get_filename()
         self.cfg["width"] = int(self.width_spin.get_value())
-        self.cfg["neutralize"] = self.neutralize_check.get_active()
         self.cfg["out_format"] = self.target_format()
         save_json(CONFIG_FILE, self.cfg)
         save_json(PROCESSED_FILE, self.processed)
@@ -743,22 +736,19 @@ class WallprepApp(Gtk.Window):
     def on_apply(self, _btn):
         if self.busy:
             return
-        neutralize = self.neutralize_check.get_active()
         out_format = self.target_format()
         jobs = []
         for p in self.selected_paths():
             st = self.info[p]
             has_staged = (st["resize_to"] or st["new_name"] or st["strip"])
-            if has_staged or neutralize or out_format:
+            if has_staged or out_format:
                 job = dict(st)
-                job["neutralize"] = neutralize
                 job["out_format"] = out_format
                 jobs.append((p, job))
         if not jobs:
             self.hint.set_label(
-                "Nothing staged — click Resize / Rename / Clean first "
-                "to preview, then Apply. (Or tick Neutralize / pick a "
-                "Format.)")
+                "Nothing staged — click Clean / Rename / Resize first "
+                "to preview, then Apply. (Or pick a Format.)")
             return
         out = self.output_dir()
         self.busy = True
@@ -799,9 +789,8 @@ class WallprepApp(Gtk.Window):
         GLib.idle_add(self._done, ok, len(jobs), out)
 
     def _apply_one(self, src: Path, st: dict, out: Path) -> Path:
-        neutralize = st.get("neutralize", False)
         out_format = st.get("out_format")  # None / "jpg" / "png"
-        strip = st["strip"] or neutralize
+        strip = st["strip"]
         # resolve target extension
         if out_format:
             ext = "." + out_format
@@ -824,16 +813,16 @@ class WallprepApp(Gtk.Window):
         # a format change forces a re-encode even if nothing else changed
         changing_format = ext != src.suffix.lower().replace(".jpeg", ".jpg")
 
-        if neutralize or strip or resized or changing_format:
+        if strip or resized or changing_format:
             cmd = ["convert", str(src)]
             if resized:
                 cmd += ["-resize",
                         f"{st['resize_to'][0]}x{st['resize_to'][1]}!"]
             if strip:
+                # full clean: drop metadata/profiles AND re-encode with
+                # standardized generic settings so the output carries no
+                # source-tool fingerprint (structural or attached)
                 cmd += ["-strip"]
-            if neutralize:
-                # standardized, generic encoder settings so outputs are
-                # uniform regardless of the source tool
                 if ext == ".png":
                     cmd += ["-define", "png:include-chunk=none",
                             "-define", "png:compression-level=9"]
@@ -855,9 +844,8 @@ class WallprepApp(Gtk.Window):
 
     def _verify(self, dest: Path, st: dict):
         """Independently re-check the output file against what was staged."""
-        neutralize = st.get("neutralize", False)
         out_format = st.get("out_format")
-        strip = st["strip"] or neutralize
+        strip = st["strip"]
         if not dest.exists():
             return False, "output file missing"
         if out_format and dest.suffix.lower().replace(".jpeg", ".jpg") \
